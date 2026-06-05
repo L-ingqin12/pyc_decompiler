@@ -85,11 +85,33 @@ def _fallback_unparse(node: ast.AST) -> str:
         func_str = _fallback_unparse(node.func)
         args_str = ", ".join(_fallback_unparse(a) for a in node.args)
         return f"{func_str}({args_str})"
-    if isinstance(node, ast.FunctionDef):
-        args_str = _fallback_unparse(node.args)
+    if isinstance(node, ast.ClassDef):
+        body = node.body if node.body else [ast.Pass()]
         body_str = "\n".join(
-            "    " + _fallback_unparse(s) for s in node.body
+            "    " + _fallback_unparse(s) for s in body
         )
+        if not body_str.strip():
+            body_str = "    pass"
+        return f"class {node.name}:\n{body_str}"
+    if isinstance(node, ast.FunctionDef):
+        args = node.args
+        # Build argument string manually
+        parts = []
+        for a in args.args:
+            parts.append(a.arg)
+        if args.vararg:
+            parts.append(f"*{args.vararg.arg}")
+        for a in args.kwonlyargs:
+            parts.append(a.arg)
+        if args.kwarg:
+            parts.append(f"**{args.kwarg.arg}")
+        args_str = ", ".join(parts)
+        body = node.body if node.body else [ast.Pass()]
+        body_str = "\n".join(
+            "    " + _fallback_unparse(s) for s in body
+        )
+        if not body_str.strip():
+            body_str = "    pass"
         return f"def {node.name}({args_str}):\n{body_str}"
     if isinstance(node, ast.Return):
         if node.value:
@@ -107,6 +129,34 @@ def _fallback_unparse(node: ast.AST) -> str:
         return f"from {node.module} import {names}"
     if isinstance(node, ast.Pass):
         return "pass"
+    if isinstance(node, ast.Attribute):
+        return f"{_fallback_unparse(node.value)}.{node.attr}"
+    if isinstance(node, ast.Subscript):
+        return f"{_fallback_unparse(node.value)}[{_fallback_unparse(node.slice)}]"
+    if isinstance(node, ast.Slice):
+        parts = []
+        if node.lower:
+            parts.append(_fallback_unparse(node.lower))
+        if node.upper:
+            parts.append(_fallback_unparse(node.upper))
+        if node.step:
+            parts.append(_fallback_unparse(node.step))
+        return ":".join(parts)
+    if isinstance(node, ast.UnaryOp):
+        op = {ast.USub: '-', ast.UAdd: '+', ast.Not: 'not ', ast.Invert: '~'}.get(type(node.op), '?')
+        return f"{op}{_fallback_unparse(node.operand)}"
+    if isinstance(node, ast.Compare):
+        left = _fallback_unparse(node.left)
+        ops = []
+        for op, comp in zip(node.ops, node.comparators):
+            op_str = _op_str(op) if isinstance(op, ast.cmpop) else '?'
+            ops.append(f"{op_str} {_fallback_unparse(comp)}")
+        return f"{left} {' '.join(ops)}"
+    if isinstance(node, ast.BoolOp):
+        op = ' and ' if isinstance(node.op, ast.And) else ' or '
+        return op.join(_fallback_unparse(v) for v in node.values)
+    if isinstance(node, ast.IfExp):
+        return f"{_fallback_unparse(node.body)} if {_fallback_unparse(node.test)} else {_fallback_unparse(node.orelse)}"
     if isinstance(node, ast.BinOp):
         left = _fallback_unparse(node.left)
         right = _fallback_unparse(node.right)
@@ -123,7 +173,7 @@ def _fallback_unparse(node: ast.AST) -> str:
     return f"<{type(node).__name__}>"
 
 
-def _op_str(op: ast.operator) -> str:
+def _op_str(op: ast.AST) -> str:
     """Convert AST operator to string."""
     mapping = {
         ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
@@ -131,5 +181,8 @@ def _op_str(op: ast.operator) -> str:
         ast.LShift: "<<", ast.RShift: ">>",
         ast.BitOr: "|", ast.BitXor: "^", ast.BitAnd: "&",
         ast.MatMult: "@",
+        ast.Lt: "<", ast.LtE: "<=", ast.Eq: "==", ast.NotEq: "!=",
+        ast.Gt: ">", ast.GtE: ">=", ast.Is: "is", ast.IsNot: "is not",
+        ast.In: "in", ast.NotIn: "not in",
     }
     return mapping.get(type(op), "?")

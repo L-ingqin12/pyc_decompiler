@@ -64,6 +64,20 @@ class ASTBuilder:
         args = self._build_args()
         return ast.Lambda(args=args, body=body_expr)
 
+    def _sanitize_name(self, name: str) -> str:
+        """Sanitize a Python identifier name (fixes genexpr .0, etc.)."""
+        if not name:
+            return "_"
+        # Replace invalid starting characters
+        if name[0] == '.':
+            name = '_dot' + name[1:]
+        # Replace other invalid characters
+        import re
+        name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        if name[0].isdigit():
+            name = '_' + name
+        return name or "_"
+
     def _build_args(self) -> ast.arguments:
         """Build function arguments from code object metadata."""
         nargs = self.info.co_argcount
@@ -76,14 +90,14 @@ class ASTBuilder:
         for i in range(nargs):
             if i < len(varnames):
                 pos_args.append(ast.arg(
-                    arg=varnames[i], annotation=None, type_comment=None))
+                    arg=self._sanitize_name(varnames[i]), annotation=None, type_comment=None))
 
         # Kw-only args
         kwonly_args = []
         for i in range(nargs, nargs + nkwonly):
             if i < len(varnames):
                 kwonly_args.append(ast.arg(
-                    arg=varnames[i], annotation=None, type_comment=None))
+                    arg=self._sanitize_name(varnames[i]), annotation=None, type_comment=None))
 
         # Vararg (*args) and kwarg (**kwargs) detection via flags
         flags = self.info.co_flags
@@ -97,12 +111,12 @@ class ASTBuilder:
         if flags & co_varargs:
             if vararg_idx < len(varnames):
                 vararg = ast.arg(
-                    arg=varnames[vararg_idx], annotation=None, type_comment=None)
+                    arg=self._sanitize_name(varnames[vararg_idx]), annotation=None, type_comment=None)
                 vararg_idx += 1
         if flags & co_varkeywords:
             if vararg_idx < len(varnames):
                 kwarg = ast.arg(
-                    arg=varnames[vararg_idx], annotation=None, type_comment=None)
+                    arg=self._sanitize_name(varnames[vararg_idx]), annotation=None, type_comment=None)
 
         # Defaults are not stored in code object — we approximate
         defaults = []
@@ -165,6 +179,12 @@ class ASTBuilder:
                 i = result[1]
                 continue
 
+            result = self._match_class_def(instructions, i)
+            if result:
+                stmts.append(result[0])
+                i = result[1]
+                continue
+
             result = self._match_function_def(instructions, i)
             if result:
                 stmts.extend(result[0])
@@ -184,14 +204,17 @@ class ASTBuilder:
             i += 1
 
         # Flush remaining stack as expression statements.
-        # Skip internal markers (PUSH_NULL placeholders) and incomplete attribute chains.
+        # Only emit "top-level" nodes that look like complete expressions.
         for expr in sim.stack:
-            if isinstance(expr, ast.Constant) and expr.value is None:
-                continue  # PUSH_NULL marker
-            if isinstance(expr, ast.Attribute) and isinstance(expr.attr, str) and expr.attr.startswith('<attr_'):
-                continue  # unresolved attribute
+            if isinstance(expr, ast.Constant):
+                if expr.value is None:
+                    continue
+            if isinstance(expr, ast.Attribute):
+                if isinstance(expr.attr, str) and expr.attr.startswith('<'):
+                    continue
             if isinstance(expr, ast.Name) and isinstance(expr.id, str) and expr.id.startswith('<'):
-                continue  # placeholder name
+                continue
+            # Only emit expression statements for non-compound expressions
             if isinstance(expr, ast.AST) and not isinstance(expr, (ast.Import, ast.ImportFrom)):
                 stmts.append(ast.Expr(value=expr))
 
@@ -202,6 +225,15 @@ class ASTBuilder:
                 last.value is None
                 or (isinstance(last.value, ast.Constant) and last.value.value is None)
             ):
+                stmts.pop()
+            else:
+                break
+
+        # Strip trailing expression statements that are bare names/comparisons
+        # (residual stack items that shouldn't be in output)
+        while stmts:
+            last = stmts[-1]
+            if isinstance(last, ast.Expr) and isinstance(last.value, (ast.Name, ast.Compare)):
                 stmts.pop()
             else:
                 break
@@ -234,63 +266,91 @@ class ASTBuilder:
           ... else/elif body ...
           end_target:
         """
-        # Find a POP_JUMP_IF_FALSE
         if start >= len(instrs):
             return None
         cond_instr = instrs[start]
         if cond_instr.opname != "POP_JUMP_IF_FALSE":
             return None
 
-        # Walk backward to get the condition (last popped value)
-        # Walk forward to find the jump target
         else_target = cond_instr.target_offset
         if else_target is None:
             return None
 
-        # Find the JUMP_FORWARD/JUMP_ABSOLUTE that ends the true body
-        true_body_start = start + 1
-        true_body_end = None
-        end_target = None
+        # Compute condition from instructions BEFORE the POP_JUMP_IF_FALSE.
+        # POP_JUMP_IF_FALSE pops the condition, so we compute up to start-1.
+        test = self._compute_expression(instrs, start - 1) if start > 0 else ast.Constant(value=None)
 
-        for j in range(true_body_start, len(instrs)):
+        # Collect true body instructions: from start+1 until else_target
+        true_instrs = []
+        true_body_end = start + 1
+        for j in range(start + 1, len(instrs)):
             jinstr = instrs[j]
             if jinstr.offset >= else_target:
+                true_body_end = j
                 break
+            # Check for JUMP_FORWARD that jumps past else_target (indicates else/elif)
             if jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
                 tgt = jinstr.target_offset
-                if tgt is not None and tgt >= else_target:
-                    true_body_end = j
-                    end_target = tgt
-                    break
-
-        if true_body_end is None:
-            # True body runs until else_target
-            true_body_end = true_body_start
-            for j in range(true_body_start, len(instrs)):
-                if instrs[j].offset >= else_target:
+                if tgt is not None and tgt > else_target:
                     true_body_end = j
                     break
-            end_target = else_target  # no else/elif
-
-        # Extract true body instructions
-        true_instrs = [ins for ins in instrs[true_body_start:true_body_end]
-                      if ins.offset < else_target]
-        test = self._compute_expression(instrs, start)
+            true_instrs.append(jinstr)
+        else:
+            true_body_end = len(instrs)
 
         # Build true body
         true_body = self._build_body(true_instrs)
+        if not true_body:
+            true_body = [ast.Pass()]
 
-        # Check for else/elif
+        # Build else/elif body
         orelse = []
+        end_target = else_target
         next_start = true_body_end
-        if end_target and end_target > else_target:
-            orelse_instrs = [ins for ins in instrs
-                           if else_target <= ins.offset < end_target]
-            if orelse_instrs:
-                # Check if this is elif (starts with another POP_JUMP_IF_FALSE)
-                orelse = self._build_body(orelse_instrs)
 
-        return ast.If(test=test, body=true_body, orelse=orelse), next_start if end_target else true_body_end
+        # Check if there's an else/elif body between else_target and end_target
+        # Find the end of the entire if/elif/else chain
+        for j in range(true_body_end, len(instrs)):
+            jinstr = instrs[j]
+            if jinstr.offset >= else_target and jinstr.opname not in {
+                "JUMP_FORWARD", "JUMP_ABSOLUTE", "POP_BLOCK",
+                "RETURN_VALUE", "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+            }:
+                # Check if this is part of else body
+                pass
+
+        # Collect else/elif instructions
+        orelse_instrs = []
+        orelse_end = true_body_end
+        if true_body_end < len(instrs):
+            first_after = instrs[true_body_end]
+            if (first_after.offset >= else_target
+                    or first_after.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}):
+                # Find the end of else block
+                jump_tgt = first_after.target_offset if first_after.opname in {
+                    "JUMP_FORWARD", "JUMP_ABSOLUTE"} else None
+                orelse_start = true_body_end + (1 if first_after.opname in {
+                    "JUMP_FORWARD", "JUMP_ABSOLUTE"} else 0)
+                for j in range(orelse_start, len(instrs)):
+                    jinstr = instrs[j]
+                    if jump_tgt and jinstr.offset >= jump_tgt:
+                        orelse_end = j
+                        break
+                    orelse_instrs.append(jinstr)
+                else:
+                    orelse_end = len(instrs)
+
+                if orelse_instrs:
+                    orelse = self._build_body(orelse_instrs)
+                    next_start = orelse_end
+                else:
+                    next_start = true_body_end
+            else:
+                next_start = true_body_end
+        else:
+            next_start = true_body_end
+
+        return ast.If(test=test, body=true_body, orelse=orelse), next_start
 
     def _match_for_loop(
         self, instrs: List[Instruction], start: int
@@ -381,7 +441,11 @@ class ASTBuilder:
     def _match_while_loop(
         self, instrs: List[Instruction], start: int
     ) -> Optional[Tuple[Union[ast.While, ast.For], int]]:
-        """Match while loop patterns."""
+        """Match while loop patterns.
+
+        A while loop has a backward jump from the body to the condition.
+        If there's no backward jump, it's an if statement (handled elsewhere).
+        """
         if start >= len(instrs):
             return None
 
@@ -394,36 +458,51 @@ class ASTBuilder:
 
         # The condition is evaluated, then POP_JUMP_IF_FALSE
         cond_end = None
+        cond_target = None
         for j in range(i, len(instrs)):
             if instrs[j].opname == "POP_JUMP_IF_FALSE":
                 target = instrs[j].target_offset
                 if target and target > instrs[j].offset:
                     cond_end = j
+                    cond_target = target
                     break
 
         if cond_end is None:
             return None
 
-        cond_target = instrs[cond_end].target_offset
-
-        # Build test expression
-        test = self._compute_expression(instrs, cond_end)
-
-        # Body: from cond_end+1 to the backward jump
+        # Find the backward jump that defines this as a while loop.
+        # A while loop MUST have a backward jump to before the condition.
         body_instrs = []
         body_end = cond_end + 1
+        has_backward = False
         for j in range(cond_end + 1, len(instrs)):
             jinstr = instrs[j]
+            # Stop if we've passed the loop exit (cond_target or setup_target)
+            loop_end_target = setup_target or cond_target
+            if (loop_end_target is not None
+                    and jinstr.offset >= loop_end_target
+                    and jinstr.opname not in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}):
+                break
             if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
                 tgt = jinstr.target_offset
-                if tgt and tgt < instrs[start].offset:
+                if tgt is not None and tgt < instrs[start].offset:
+                    # Found backward jump to start — this IS a while loop
+                    has_backward = True
                     body_instrs = instrs[cond_end + 1:j]
                     body_end = j + 1
                     break
 
-        body = self._build_body(body_instrs)
+        # No backward jump = not a while loop (it's an if statement)
+        if not has_backward:
+            return None
 
-        # While loops in bytecode don't have a natural else
+        # Build test expression
+        test = self._compute_expression(instrs, cond_end)
+
+        body = self._build_body(body_instrs)
+        if not body:
+            body = [ast.Pass()]
+
         return ast.While(test=test, body=body, orelse=[]), body_end
 
     def _match_try_except(
@@ -487,6 +566,8 @@ class ASTBuilder:
         try_instrs = [ins for ins in instrs[start + 1:pop_block_idx + 1]
                       if ins.offset < handler_target]
         try_body = self._build_body(try_instrs)
+        if not try_body:
+            try_body = [ast.Pass()]
 
         # Handler body
         handler_end = pop_block_idx + 1
@@ -499,6 +580,8 @@ class ASTBuilder:
         handler_instrs = [ins for ins in instrs
                          if handler_target <= ins.offset < (end_target or handler_target + 100)]
         handler_body = self._build_body(handler_instrs)
+        if not handler_body:
+            handler_body = [ast.Pass()]
 
         # Determine if finally (SETUP_FINALLY) or except (SETUP_EXCEPT)
         if instr.opname == "SETUP_FINALLY":
@@ -574,6 +657,79 @@ class ASTBuilder:
             type_comment=None,
         ), body_end + 1
 
+    def _match_class_def(
+        self, instrs: List[Instruction], start: int
+    ) -> Optional[Tuple[ast.ClassDef, int]]:
+        """Match class definition patterns.
+
+        3.7/3.8 pattern:
+          LOAD_BUILD_CLASS
+          LOAD_CONST <class body code object>
+          LOAD_CONST '<ClassName>'
+          MAKE_FUNCTION 0
+          LOAD_CONST '<ClassName>'
+          CALL_FUNCTION 2            ← __build_class__(body, name)
+          STORE_NAME <ClassName>
+        """
+        if start >= len(instrs):
+            return None
+        i0 = instrs[start]
+        if i0.opname != "LOAD_BUILD_CLASS":
+            return None
+
+        # Need at least 7 instructions for the full pattern
+        if start + 6 >= len(instrs):
+            return None
+
+        i1, i2, i3, i4, i5, i6 = (
+            instrs[start+1], instrs[start+2], instrs[start+3],
+            instrs[start+4], instrs[start+5], instrs[start+6],
+        )
+
+        # Pattern: LOAD_CONST(code), LOAD_CONST(name), MAKE_FUNCTION,
+        #          LOAD_CONST(name2), CALL_FUNCTION, STORE_NAME
+        if not (i1.opname == "LOAD_CONST" and i2.opname == "LOAD_CONST"
+                and i3.opname in {"MAKE_FUNCTION", "MAKE_CLOSURE"}
+                and i4.opname == "LOAD_CONST"
+                and i5.opname in {"CALL_FUNCTION", "CALL"}
+                and i6.opname.startswith("STORE_")):
+            return None
+
+        import types
+        from .types import CodeObjectInfo
+        from .loader import _extract_code_info, _collect_nested_code_objects
+
+        class_info = None
+        if isinstance(i1.argval, types.CodeType):
+            class_info = _extract_code_info(i1.argval)
+            _collect_nested_code_objects(class_info)
+        elif isinstance(i1.argval, CodeObjectInfo):
+            class_info = i1.argval
+
+        if class_info is None:
+            return None
+
+        class_name = i2.argval if isinstance(i2.argval, str) else ""
+
+        # Disassemble class body
+        if not class_info.instructions:
+            from .disassembler import disassemble_all
+            disassemble_all(class_info, self.ops_mod)
+
+        # Build class body
+        builder = ASTBuilder(class_info, self.ops_mod)
+        class_body = builder._build_body(class_info.instructions)
+        if not class_body:
+            class_body = [ast.Pass()]
+
+        return ast.ClassDef(
+            name=class_name,
+            bases=[],
+            keywords=[],
+            body=class_body,
+            decorator_list=[],
+        ), start + 7
+
     def _match_function_def(
         self, instrs: List[Instruction], start: int
     ) -> Optional[Tuple[List[ast.stmt], int]]:
@@ -648,7 +804,16 @@ class ASTBuilder:
 
         builder = ASTBuilder(nested_info, self.ops_mod)
         func_def = builder.build_function()
-        func_def.name = func_name
+        # Sanitize function name: handle lambdas, genexprs, listcomps
+        # which have names like "Parent.<locals>.<lambda>"
+        clean_name = func_name
+        if '<' in clean_name or '.' in clean_name:
+            clean_name = clean_name.replace('<', '_').replace('>', '_')
+            clean_name = clean_name.replace('.', '_')
+        func_def.name = clean_name
+        # Ensure non-empty body
+        if not func_def.body:
+            func_def.body = [ast.Pass()]
 
         return [func_def], store_idx
 
@@ -767,12 +932,28 @@ class ASTBuilder:
           ... body ...
 
         The loop variable is stored in the instruction AFTER FOR_ITER.
+        Handles UNPACK_SEQUENCE for tuple unpacking like 'for a, b in ...'.
         """
         if for_iter_idx + 1 < len(instrs):
             next_instr = instrs[for_iter_idx + 1]
             if next_instr.opname == "UNPACK_SEQUENCE":
-                # for a, b in ... → find subsequent STORE_FAST instructions
-                return _name_node(f"<unpack_{next_instr.arg}>")
+                # for a, b in iterable →
+                #   UNPACK_SEQUENCE 2
+                #   STORE_FAST a
+                #   STORE_FAST b
+                n = next_instr.arg
+                names = []
+                for k in range(for_iter_idx + 2, min(for_iter_idx + 2 + n, len(instrs))):
+                    si = instrs[k]
+                    if si.opname in {"STORE_FAST", "STORE_NAME", "STORE_DEREF"}:
+                        names.append(_name_node(si.argval or f"<v{si.arg}>", ctx=ast.Store))
+                    else:
+                        break
+                if len(names) == n:
+                    return ast.Tuple(elts=names, ctx=ast.Store())
+                elif len(names) > 0:
+                    return names[0]
+                return _name_node(f"<unpack_{n}>")
             if next_instr.opname in {"STORE_FAST", "STORE_NAME", "STORE_DEREF"}:
                 return _name_node(next_instr.argval or f"<var_{next_instr.arg}>")
         return _name_node("<loop_var>")
