@@ -8,16 +8,21 @@ Handles the .pyc file format for Python 3.7+:
   - remaining: marshaled code object
 
 Reference: PEP 552, PEP 3147
+
+Python's marshal format is version-specific (not backward-compatible).
+When the host Python version differs from the .pyc version, we delegate
+unmarshaling to the matching Python interpreter via xmarshal.
 """
 
 from __future__ import annotations
 
 import marshal
 import struct
+import sys
 import types
 from typing import Tuple
 
-from .magics import MAGIC_TO_VERSION, format_version, get_python_version, is_supported
+from .magics import format_version, get_python_version, is_supported
 from .types import CodeObjectInfo
 
 
@@ -97,7 +102,7 @@ def load_pyc(filepath: str) -> CodeObjectInfo:
     if len(data) < 16:
         raise LoadError(f"File too short: {len(data)} bytes, expected >= 16")
 
-    magic_word, flags, timestamp_or_hash, source_size = _read_pyc_header(data)
+    magic_word, _flags, _timestamp_or_hash, _source_size = _read_pyc_header(data)
 
     # Look up Python version (exact match + range fallback)
     version = get_python_version(magic_word)
@@ -113,7 +118,19 @@ def load_pyc(filepath: str) -> CodeObjectInfo:
             f"is not yet supported. Currently supports: Python 3.7, 3.8."
         )
 
-    # Unmarshal the code object from after the header
+    # Use cross-version unmarshaling if the host Python differs from the
+    # .pyc version. Python's marshal format is not backward-compatible.
+    host_ver = (sys.version_info.major, sys.version_info.minor)
+    if version != host_ver:
+        try:
+            from .xmarshal import load_pyc_cross_version
+            return load_pyc_cross_version(filepath, version)
+        except Exception as e:
+            raise LoadError(
+                f"Cross-version load failed for Python {format_version(version)}: {e}"
+            ) from e
+
+    # Unmarshal the code object from after the header (same-version path)
     header_size = 16
     try:
         co = marshal.loads(data[header_size:])

@@ -362,6 +362,12 @@ class StackSimulator:
             else:
                 func = func_or_self
 
+            # For CALL_METHOD: LOAD_METHOD left [self, method] on stack.
+            # After popping args and method, the implicit self remains.
+            if opname == "CALL_METHOD":
+                if self.stack:
+                    self.pop()  # discard implicit self
+
             # Check for KW_NAMES - stored in _pending_kw_names
             keywords = []
             kw_names = getattr(self, '_pending_kw_names', None)

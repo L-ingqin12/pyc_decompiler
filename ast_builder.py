@@ -190,8 +190,21 @@ class ASTBuilder:
                 continue  # PUSH_NULL marker
             if isinstance(expr, ast.Attribute) and isinstance(expr.attr, str) and expr.attr.startswith('<attr_'):
                 continue  # unresolved attribute
+            if isinstance(expr, ast.Name) and isinstance(expr.id, str) and expr.id.startswith('<'):
+                continue  # placeholder name
             if isinstance(expr, ast.AST) and not isinstance(expr, (ast.Import, ast.ImportFrom)):
                 stmts.append(ast.Expr(value=expr))
+
+        # Strip trailing implicit "return None" (CPython adds this to every module)
+        while stmts:
+            last = stmts[-1]
+            if isinstance(last, ast.Return) and (
+                last.value is None
+                or (isinstance(last.value, ast.Constant) and last.value.value is None)
+            ):
+                stmts.pop()
+            else:
+                break
 
         return stmts
 
@@ -354,7 +367,7 @@ class ASTBuilder:
 
         # Build AST
         iter_expr = self._compute_expression(instrs, get_iter_idx - 1)
-        target = self._compute_loop_target(instrs, body_target)
+        target = self._compute_loop_target(instrs, for_iter_idx)
         body = self._build_body(body_instrs)
 
         return ast.For(
@@ -582,10 +595,13 @@ class ASTBuilder:
 
         import types
 
+        from .types import CodeObjectInfo
+        from .loader import _extract_code_info, _collect_nested_code_objects
+
         i0 = instrs[start]
         i1 = instrs[start + 1] if start + 1 < len(instrs) else None
         i2 = instrs[start + 2] if start + 2 < len(instrs) else None
-        code_obj = None
+        nested_info = None
         func_name = "<function>"
         store_idx = start + 2
 
@@ -593,20 +609,30 @@ class ASTBuilder:
         if (i0.opname == "LOAD_CONST" and i1 and i1.opname == "LOAD_CONST"
                 and i2 and i2.opname in {"MAKE_FUNCTION", "MAKE_CLOSURE"}):
             if isinstance(i0.argval, types.CodeType):
-                code_obj = i0.argval
+                nested_info = _extract_code_info(i0.argval)
+                _collect_nested_code_objects(nested_info)
+                func_name = i1.argval if isinstance(i1.argval, str) else "<function>"
+                store_idx = start + 3
+            elif isinstance(i0.argval, CodeObjectInfo):
+                nested_info = i0.argval
                 func_name = i1.argval if isinstance(i1.argval, str) else "<function>"
                 store_idx = start + 3
         # Check for 3.12 pattern: LOAD_CONST (code) → MAKE_FUNCTION
         elif (i0.opname == "LOAD_CONST" and i1
                 and i1.opname in {"MAKE_FUNCTION", "MAKE_CLOSURE"}):
             if isinstance(i0.argval, types.CodeType):
-                code_obj = i0.argval
-                func_name = code_obj.co_name  # name is in code object
+                nested_info = _extract_code_info(i0.argval)
+                _collect_nested_code_objects(nested_info)
+                func_name = nested_info.co_name
+                store_idx = start + 2
+            elif isinstance(i0.argval, CodeObjectInfo):
+                nested_info = i0.argval
+                func_name = nested_info.co_name
                 store_idx = start + 2
         else:
             return None
 
-        if code_obj is None:
+        if nested_info is None:
             return None
 
         # Check if there's a STORE instruction after MAKE_FUNCTION
@@ -614,13 +640,11 @@ class ASTBuilder:
             func_name = instrs[store_idx].argval or func_name
             store_idx += 1
 
-        # Recursively decompile the nested code object
-        from .loader import _extract_code_info, _collect_nested_code_objects
-        nested_info = _extract_code_info(code_obj)
-        _collect_nested_code_objects(nested_info)
-
         from .disassembler import disassemble_all
-        disassemble_all(nested_info, self.ops_mod)
+        # For CodeObjectInfo from xmarshal, nested code objects are already populated
+        # and instructions may already be set. Only disassemble if needed.
+        if not nested_info.instructions:
+            disassemble_all(nested_info, self.ops_mod)
 
         builder = ASTBuilder(nested_info, self.ops_mod)
         func_def = builder.build_function()
@@ -732,15 +756,25 @@ class ASTBuilder:
         return ast.Constant(value=None)
 
     def _compute_loop_target(
-        self, instrs: List[Instruction], body_target: int
+        self, instrs: List[Instruction], for_iter_idx: int
     ) -> ast.expr:
-        """Compute the loop variable from the for loop setup."""
-        # The target is the value stored at body_target
-        for instr in instrs:
-            if instr.offset == body_target:
-                if instr.opname in {"STORE_FAST", "STORE_NAME"}:
-                    return _name_node(instr.argval or f"<var_{instr.arg}>")
-                break
+        """Compute the loop variable from the for loop setup.
+
+        In Python 3.7/3.8 bytecode:
+          GET_ITER
+          FOR_ITER <exit_target>   # pushes next item, or jumps to exit
+          STORE_FAST <var>         # loop variable (right after FOR_ITER)
+          ... body ...
+
+        The loop variable is stored in the instruction AFTER FOR_ITER.
+        """
+        if for_iter_idx + 1 < len(instrs):
+            next_instr = instrs[for_iter_idx + 1]
+            if next_instr.opname == "UNPACK_SEQUENCE":
+                # for a, b in ... → find subsequent STORE_FAST instructions
+                return _name_node(f"<unpack_{next_instr.arg}>")
+            if next_instr.opname in {"STORE_FAST", "STORE_NAME", "STORE_DEREF"}:
+                return _name_node(next_instr.argval or f"<var_{next_instr.arg}>")
         return _name_node("<loop_var>")
 
 

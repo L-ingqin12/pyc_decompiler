@@ -11,18 +11,22 @@ from typing import Optional
 
 
 def _fix_missing_locations(node: ast.AST, lineno: int = 1, col_offset: int = 0) -> None:
-    """Recursively set lineno and col_offset on AST nodes that lack them.
+    """Set lineno and col_offset on AST nodes that lack them.
 
-    ast.unparse() in Python 3.12 requires lineno on every node.
+    Uses iterative traversal to avoid recursion depth issues with deeply
+    nested ASTs (e.g., large classes with many methods).
     """
-    if not hasattr(node, 'lineno') or node.lineno is None:
-        node.lineno = lineno
-        node.col_offset = col_offset
-        node.end_lineno = lineno
-        node.end_col_offset = col_offset + 1
-
-    for child in ast.iter_child_nodes(node):
-        _fix_missing_locations(child, lineno, col_offset)
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if not hasattr(n, 'lineno') or n.lineno is None:
+            n.lineno = lineno
+            n.col_offset = col_offset
+            n.end_lineno = lineno
+            n.end_col_offset = col_offset + 1
+        # Extend stack with children (reverse order for consistent traversal)
+        children = list(ast.iter_child_nodes(n))
+        stack.extend(reversed(children))
 
 
 def generate_source(node: ast.AST) -> str:
