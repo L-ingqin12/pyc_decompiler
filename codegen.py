@@ -190,6 +190,115 @@ def _fallback_unparse(node: ast.AST) -> str:
             else_body = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
             result += f"\nelse:\n{else_body}"
         return result
+    if isinstance(node, ast.AugAssign):
+        target = _fallback_unparse(node.target)
+        op = _op_str(node.op)
+        value = _fallback_unparse(node.value)
+        return f"{target} {op}= {value}"
+    if isinstance(node, ast.FormattedValue):
+        val = _fallback_unparse(node.value)
+        conv = {0: '', 1: '!s', 2: '!r', 3: '!a'}.get(node.conversion, '')
+        fmt = f":{_fallback_unparse(node.format_spec)}" if node.format_spec else ''
+        return f"{{{val}{conv}{fmt}}}"
+    if isinstance(node, ast.JoinedStr):
+        parts = ''.join(
+            _fallback_unparse(v) if isinstance(v, ast.FormattedValue)
+            else v.value if isinstance(v, ast.Constant) else str(v)
+            for v in node.values
+        )
+        return f"f'{parts}'"
+    if isinstance(node, ast.Try):
+        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        result = f"try:\n{body}"
+        for h in node.handlers:
+            handler = _fallback_unparse(h)
+            result += f"\n{handler}"
+        if node.orelse:
+            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
+            result += f"\nelse:\n{orelse}"
+        if node.finalbody:
+            fb = "\n".join("    " + _fallback_unparse(s) for s in node.finalbody)
+            result += f"\nfinally:\n{fb}"
+        return result
+    if isinstance(node, ast.ExceptHandler):
+        t = _fallback_unparse(node.type) if node.type else ''
+        name = f" as {node.name}" if node.name else ''
+        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        return f"except {t}{name}:\n{body}"
+    if isinstance(node, ast.Raise):
+        exc = _fallback_unparse(node.exc) if node.exc else ''
+        cause = f" from {_fallback_unparse(node.cause)}" if node.cause else ''
+        return f"raise {exc}{cause}".strip()
+    if isinstance(node, ast.Expr):
+        return _fallback_unparse(node.value)
+    if isinstance(node, ast.For):
+        target = _fallback_unparse(node.target)
+        iter_ = _fallback_unparse(node.iter)
+        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        result = f"for {target} in {iter_}:\n{body}"
+        if node.orelse:
+            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
+            result += f"\nelse:\n{orelse}"
+        return result
+    if isinstance(node, ast.While):
+        test = _fallback_unparse(node.test)
+        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        result = f"while {test}:\n{body}"
+        if node.orelse:
+            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
+            result += f"\nelse:\n{orelse}"
+        return result
+    if isinstance(node, ast.With):
+        items = ", ".join(
+            f"{_fallback_unparse(it.context_expr)}"
+            + (f" as {_fallback_unparse(it.optional_vars)}" if it.optional_vars else '')
+            for it in node.items
+        )
+        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        return f"with {items}:\n{body}"
+    if isinstance(node, ast.Starred):
+        return f"*{_fallback_unparse(node.value)}"
+    if isinstance(node, ast.Yield):
+        return f"yield {_fallback_unparse(node.value)}" if node.value else "yield"
+    if isinstance(node, ast.YieldFrom):
+        return f"yield from {_fallback_unparse(node.value)}"
+    if isinstance(node, ast.Lambda):
+        args_str = ", ".join(a.arg for a in node.args.args)
+        body = _fallback_unparse(node.body)
+        return f"lambda {args_str}: {body}"
+    if isinstance(node, ast.arguments):
+        parts = [a.arg for a in node.args]
+        if node.vararg:
+            parts.append(f"*{node.vararg.arg}")
+        parts.extend(a.arg for a in node.kwonlyargs)
+        if node.kwarg:
+            parts.append(f"**{node.kwarg.arg}")
+        return ", ".join(parts)
+    if isinstance(node, ast.keyword):
+        v = _fallback_unparse(node.value)
+        return f"{node.arg}={v}" if node.arg else f"**{v}"
+    if isinstance(node, ast.Delete):
+        targets = ", ".join(_fallback_unparse(t) for t in node.targets)
+        return f"del {targets}"
+    if isinstance(node, ast.Assert):
+        test = _fallback_unparse(node.test)
+        msg = f", {_fallback_unparse(node.msg)}" if node.msg else ''
+        return f"assert {test}{msg}"
+    if isinstance(node, ast.Global):
+        return f"global {', '.join(node.names)}"
+    if isinstance(node, ast.Nonlocal):
+        return f"nonlocal {', '.join(node.names)}"
+    if isinstance(node, ast.Pass):
+        return "pass"
+    if isinstance(node, ast.Break):
+        return "break"
+    if isinstance(node, ast.Continue):
+        return "continue"
+    if isinstance(node, ast.Call):
+        args = ", ".join(_fallback_unparse(a) for a in node.args)
+        kwargs = ", ".join(_fallback_unparse(k) for k in node.keywords)
+        all_args = ", ".join(filter(None, [args, kwargs]))
+        return f"{_fallback_unparse(node.func)}({all_args})"
     return f"<{type(node).__name__}>"
 
 
