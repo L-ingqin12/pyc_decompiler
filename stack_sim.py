@@ -692,8 +692,6 @@ class StackSimulator:
 
         # --- Jump-like (handled by CFG, no stack effect here) ---
         elif opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE", "JUMP_BACKWARD",
-                        "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
-                        "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
                         "FOR_ITER", "SETUP_FINALLY", "SETUP_EXCEPT",
                         "SETUP_WITH", "SETUP_ASYNC_WITH", "SETUP_LOOP",
                         "BREAK_LOOP", "CONTINUE_LOOP", "POP_BLOCK",
@@ -704,6 +702,24 @@ class StackSimulator:
                         "LIST_TO_TUPLE", "WITH_CLEANUP_START",
                         "WITH_CLEANUP_FINISH"}:
             pass
+
+        # --- Conditional jumps with stack effect ---
+        elif opname in {"POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"}:
+            # Pop condition value (consumed by the branch)
+            if self.stack:
+                self.pop()
+
+        elif opname == "JUMP_IF_FALSE_OR_POP":
+            # and: TOS is left operand. If false, jump (keep TOS).
+            # If true (fallthrough), pop TOS and continue to evaluate right.
+            # We can't know which path at simulation time, so peek and
+            # leave TOS for the merge point.
+            pass  # TOS stays for the false/cleanup path
+
+        elif opname == "JUMP_IF_TRUE_OR_POP":
+            # or: TOS is left operand. If true, jump (keep TOS).
+            # If false (fallthrough), pop TOS and continue.
+            pass  # TOS stays for the true/cleanup path
 
         # --- Delete ---
         elif opname.startswith("DELETE_"):
