@@ -100,13 +100,16 @@ def _fallback_unparse(node: ast.AST) -> str:
         elts = ", ".join(_fallback_unparse(e) for e in node.elts)
         return "{" + elts + "}"
     if isinstance(node, ast.ClassDef):
+        bases_str = ""
+        if node.bases:
+            bases_str = "(" + ", ".join(_fallback_unparse(b) for b in node.bases) + ")"
         body = node.body if node.body else [ast.Pass()]
         body_str = "\n".join(
             "    " + _fallback_unparse(s) for s in body
         )
         if not body_str.strip():
             body_str = "    pass"
-        return f"class {node.name}:\n{body_str}"
+        return f"class {node.name}{bases_str}:\n{body_str}"
     if isinstance(node, ast.FunctionDef):
         args = node.args
         # Build argument string manually

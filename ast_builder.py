@@ -229,11 +229,37 @@ class ASTBuilder:
             else:
                 break
 
-        # Strip trailing expression statements that are bare names/comparisons
-        # (residual stack items that shouldn't be in output)
+        # Strip trailing expression statements that are residual stack junk
         while stmts:
             last = stmts[-1]
-            if isinstance(last, ast.Expr) and isinstance(last.value, (ast.Name, ast.Compare)):
+            if isinstance(last, ast.Expr):
+                v = last.value
+                # Bare names, compares, tuples, constants, lists — obvious junk
+                if isinstance(v, (ast.Name, ast.Compare, ast.Tuple,
+                                  ast.List, ast.Set, ast.Dict)):
+                    stmts.pop()
+                elif isinstance(v, ast.Constant):
+                    if v.value is not None and not isinstance(v.value, str):
+                        stmts.pop()
+                    else:
+                        break
+                elif isinstance(v, ast.Call):
+                    # Bare function calls without assignment are often junk
+                    stmts.pop()
+                elif isinstance(v, ast.BinOp):
+                    stmts.pop()
+                else:
+                    break
+            else:
+                break
+
+        # Strip trailing "return None" at module level
+        while stmts:
+            last = stmts[-1]
+            if isinstance(last, ast.Return) and (
+                last.value is None
+                or (isinstance(last.value, ast.Constant) and last.value.value is None)
+            ):
                 stmts.pop()
             else:
                 break
@@ -662,14 +688,27 @@ class ASTBuilder:
     ) -> Optional[Tuple[ast.ClassDef, int]]:
         """Match class definition patterns.
 
-        3.7/3.8 pattern:
+        3.7/3.8 pattern (no base):
           LOAD_BUILD_CLASS
           LOAD_CONST <class body code object>
           LOAD_CONST '<ClassName>'
           MAKE_FUNCTION 0
           LOAD_CONST '<ClassName>'
           CALL_FUNCTION 2            ← __build_class__(body, name)
-          STORE_NAME <ClassName>
+
+        3.7/3.8 pattern (with bases like unittest.TestCase):
+          LOAD_BUILD_CLASS
+          LOAD_CONST <class body code object>
+          LOAD_CONST '<ClassName>'
+          MAKE_FUNCTION 0
+          LOAD_CONST '<ClassName>'
+          LOAD_NAME <base_module>    ← e.g. 'unittest'
+          LOAD_ATTR <base_name>      ← e.g. 'TestCase'
+          CALL_FUNCTION 3            ← __build_class__(body, name, base)
+
+        The pattern length varies; we detect the mandatory prefix
+        (LOAD_BUILD_CLASS + LOAD_CONST + LOAD_CONST + MAKE_FUNCTION)
+        then scan forward to find CALL_FUNCTION + STORE_NAME.
         """
         if start >= len(instrs):
             return None
@@ -677,22 +716,18 @@ class ASTBuilder:
         if i0.opname != "LOAD_BUILD_CLASS":
             return None
 
-        # Need at least 7 instructions for the full pattern
+        # Need at least 7 instructions for minimum pattern
         if start + 6 >= len(instrs):
             return None
 
-        i1, i2, i3, i4, i5, i6 = (
-            instrs[start+1], instrs[start+2], instrs[start+3],
-            instrs[start+4], instrs[start+5], instrs[start+6],
-        )
+        i1 = instrs[start + 1] if start + 1 < len(instrs) else None
+        i2 = instrs[start + 2] if start + 2 < len(instrs) else None
+        i3 = instrs[start + 3] if start + 3 < len(instrs) else None
 
-        # Pattern: LOAD_CONST(code), LOAD_CONST(name), MAKE_FUNCTION,
-        #          LOAD_CONST(name2), CALL_FUNCTION, STORE_NAME
-        if not (i1.opname == "LOAD_CONST" and i2.opname == "LOAD_CONST"
-                and i3.opname in {"MAKE_FUNCTION", "MAKE_CLOSURE"}
-                and i4.opname == "LOAD_CONST"
-                and i5.opname in {"CALL_FUNCTION", "CALL"}
-                and i6.opname.startswith("STORE_")):
+        # Mandatory prefix: LOAD_CONST(code), LOAD_CONST(name), MAKE_FUNCTION
+        if not (i1 and i1.opname == "LOAD_CONST"
+                and i2 and i2.opname == "LOAD_CONST"
+                and i3 and i3.opname in {"MAKE_FUNCTION", "MAKE_CLOSURE"}):
             return None
 
         import types
@@ -705,18 +740,52 @@ class ASTBuilder:
             _collect_nested_code_objects(class_info)
         elif isinstance(i1.argval, CodeObjectInfo):
             class_info = i1.argval
-
         if class_info is None:
             return None
 
         class_name = i2.argval if isinstance(i2.argval, str) else ""
+
+        # Scan forward from i3+1 to find CALL_FUNCTION + STORE_NAME
+        # Collect base classes from LOAD_NAME/LOAD_ATTR pairs before CALL
+        call_idx = None
+        store_idx = None
+        bases = []
+        base_instrs = []
+        for j in range(start + 4, min(start + 12, len(instrs))):
+            jinstr = instrs[j]
+            if jinstr.opname in {"CALL_FUNCTION", "CALL"}:
+                call_idx = j
+                break
+            base_instrs.append(jinstr)
+
+        if call_idx is None or call_idx + 1 >= len(instrs):
+            return None
+        store_instr = instrs[call_idx + 1]
+        if not store_instr.opname.startswith("STORE_"):
+            return None
+        store_idx = call_idx + 1
+
+        # Use stack simulator to compute base class expressions.
+        # base_instrs has instructions between MAKE_FUNCTION and CALL_FUNCTION.
+        # The first instruction is always LOAD_CONST (class name).
+        # After that, instructions compute bases. We simulate them on a stack.
+        base_sim = StackSimulator(self.info)
+        for bi in base_instrs:
+            base_sim.process_instruction(bi)
+        # The stack after simulation has [Const(name), ...bases]
+        # Pop the first item (repeated class name), remainder are bases
+        if base_sim.stack:
+            # First item is the LOAD_CONST name
+            name_item = base_sim.stack[0]
+            if isinstance(name_item, ast.Constant):
+                base_sim.stack.pop(0)
+        bases = list(base_sim.stack)
 
         # Disassemble class body
         if not class_info.instructions:
             from .disassembler import disassemble_all
             disassemble_all(class_info, self.ops_mod)
 
-        # Build class body
         builder = ASTBuilder(class_info, self.ops_mod)
         class_body = builder._build_body(class_info.instructions)
         if not class_body:
@@ -724,11 +793,11 @@ class ASTBuilder:
 
         return ast.ClassDef(
             name=class_name,
-            bases=[],
+            bases=bases,
             keywords=[],
             body=class_body,
             decorator_list=[],
-        ), start + 7
+        ), store_idx + 1
 
     def _match_function_def(
         self, instrs: List[Instruction], start: int
