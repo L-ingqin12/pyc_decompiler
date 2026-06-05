@@ -736,3 +736,109 @@ def simulate_block(
         s = sim.process_instruction(instr)
         stmts.extend(s)
     return stmts, list(sim.stack)
+
+
+class BlockStackSimulator:
+    """Manages stack state across basic blocks using CFG structure.
+
+    The existing StackSimulator correctly handles per-instruction
+    expression recovery within a single block. This class manages
+    state propagation between blocks: at each block entry, the stack
+    state is inherited from the immediate dominator; at join points
+    (blocks with multiple predecessors), the canonical state comes
+    from the dominator path. This avoids the single-path simulation
+    issues that cause variable assignments and intermediate expressions
+    to be lost across control-flow boundaries.
+    """
+
+    def __init__(
+        self,
+        info: CodeObjectInfo,
+        blocks: List[BasicBlock],
+        idom: Optional[Dict[int, Optional[int]]] = None,
+    ):
+        self.info = info
+        self.blocks = blocks
+        self.idom = idom or {}
+        # Per-block cached entry/exit states
+        self._entry_states: Dict[int, Optional[List[ast.AST]]] = {}
+        self._exit_states: Dict[int, Optional[List[ast.AST]]] = {}
+        self._stmts: Dict[int, List[ast.stmt]] = {}
+
+    def simulate_all(self) -> List[ast.stmt]:
+        """Simulate all blocks and return combined statement list."""
+        if not self.blocks:
+            return []
+
+        # Order blocks for simulation: dominator-tree preorder
+        ordered = self._order_blocks()
+
+        for block in ordered:
+            entry = self._get_entry_state(block)
+            sim = StackSimulator(self.info)
+            sim.stack = list(entry)  # copy entry state
+            stmts, exit_stack = simulate_block(sim, block)
+            self._stmts[block.id] = stmts
+            self._exit_states[block.id] = exit_stack
+
+        # Collect statements in block order
+        all_stmts: List[ast.stmt] = []
+        for block in self.blocks:
+            all_stmts.extend(self._stmts.get(block.id, []))
+        return all_stmts
+
+    def _get_entry_state(self, block: BasicBlock) -> List[ast.AST]:
+        """Compute the entry stack state for a block.
+
+        If the block has a single predecessor, use that predecessor's
+        exit state. If multiple predecessors (join point), use the
+        immediate dominator's exit state — in well-formed CPython
+        bytecode, all paths to a join have the same stack depth and
+        compatible types. The dominator path is the canonical one.
+        """
+        if block.id in self._entry_states and self._entry_states[block.id] is not None:
+            return self._entry_states[block.id]  # type: ignore[return-value]
+
+        # Use dominator's exit state
+        dom = self.idom.get(block.id)
+        if dom is not None and dom in self._exit_states and self._exit_states[dom] is not None:
+            state = list(self._exit_states[dom])  # type: ignore[arg-type]
+        elif block.predecessor_ids:
+            # Try first predecessor that has been simulated
+            state = []
+            for pid in block.predecessor_ids:
+                if pid in self._exit_states and self._exit_states[pid] is not None:
+                    state = list(self._exit_states[pid])  # type: ignore[arg-type]
+                    break
+        else:
+            state = []
+
+        self._entry_states[block.id] = state
+        return state
+
+    def _order_blocks(self) -> List[BasicBlock]:
+        """Return blocks in dominator-tree preorder for deterministic simulation."""
+        children: Dict[int, List[int]] = {}
+        for b in self.blocks:
+            pid = self.idom.get(b.id)
+            if pid is not None and pid >= 0 and pid < len(self.blocks):
+                children.setdefault(pid, []).append(b.id)
+
+        result: List[BasicBlock] = []
+        visited: Set[int] = set()
+
+        def dfs(bid: int):
+            if bid in visited or bid >= len(self.blocks):
+                return
+            visited.add(bid)
+            result.append(self.blocks[bid])
+            for cid in children.get(bid, []):
+                dfs(cid)
+
+        entry = next((b for b in self.blocks if b.is_entry), self.blocks[0])
+        dfs(entry.id)
+        # Append any unreachable blocks
+        for b in self.blocks:
+            if b.id not in visited:
+                result.append(b)
+        return result

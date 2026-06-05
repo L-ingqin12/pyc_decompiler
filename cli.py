@@ -77,9 +77,9 @@ def decompile_file(
         # Build CFG
         cfg = build_cfg(blocks, ops_mod)
 
-        # Build AST
+        # Build AST — pass CFG for structural validation
         try:
-            ast_node = build_ast(info, ops_mod)
+            ast_node = build_ast(info, ops_mod, cfg)
             info.ast_node = ast_node
         except Exception as e:
             module.errors.append(f"AST construction failed: {e}")

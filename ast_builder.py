@@ -19,7 +19,7 @@ Supported constructs:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .types import Instruction, BasicBlock, CodeObjectInfo
 from .stack_sim import StackSimulator, _name_node, _const_node, _attr_node
@@ -29,12 +29,20 @@ from .opcodes.base import CMP_OP
 class ASTBuilder:
     """Builds Python AST from decompiled bytecode."""
 
-    def __init__(self, info: CodeObjectInfo, ops_mod: Any):
+    def __init__(self, info: CodeObjectInfo, ops_mod: Any, cfg: Any = None):
         self.info = info
         self.ops_mod = ops_mod
         self.instructions = info.instructions
         self.blocks = info.blocks
+        self.cfg = cfg
         self.sim = StackSimulator(info)
+        # Cache CFG-derived data for pattern validation
+        self._loop_headers: Optional[Set[int]] = None
+        if cfg is not None:
+            self._loop_headers = cfg.find_loop_headers()
+            self._idom = cfg.immediate_dominators()
+        else:
+            self._idom = {}
 
     def build_module(self) -> ast.Module:
         """Build an ast.Module from the top-level code object."""
@@ -471,6 +479,9 @@ class ASTBuilder:
 
         A while loop has a backward jump from the body to the condition.
         If there's no backward jump, it's an if statement (handled elsewhere).
+
+        When CFG data is available, validates against loop headers detected
+        by dominator-based back-edge analysis for extra confidence.
         """
         if start >= len(instrs):
             return None
@@ -497,13 +508,11 @@ class ASTBuilder:
             return None
 
         # Find the backward jump that defines this as a while loop.
-        # A while loop MUST have a backward jump to before the condition.
         body_instrs = []
         body_end = cond_end + 1
         has_backward = False
         for j in range(cond_end + 1, len(instrs)):
             jinstr = instrs[j]
-            # Stop if we've passed the loop exit (cond_target or setup_target)
             loop_end_target = setup_target or cond_target
             if (loop_end_target is not None
                     and jinstr.offset >= loop_end_target
@@ -512,13 +521,22 @@ class ASTBuilder:
             if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
                 tgt = jinstr.target_offset
                 if tgt is not None and tgt < instrs[start].offset:
-                    # Found backward jump to start — this IS a while loop
                     has_backward = True
                     body_instrs = instrs[cond_end + 1:j]
                     body_end = j + 1
                     break
 
-        # No backward jump = not a while loop (it's an if statement)
+        # If CFG available, cross-check: if this block is NOT a loop header
+        # (no back-edge detected by dominator analysis), it's likely an if.
+        if self._loop_headers is not None and has_backward:
+            # Find which basic block the loop header is in
+            for block in self.blocks:
+                if block.start_offset <= instrs[start].offset <= block.end_offset:
+                    if block.id not in self._loop_headers:
+                        # CFG says this is NOT a loop — trust the CFG
+                        has_backward = False
+                    break
+
         if not has_backward:
             return None
 
@@ -786,7 +804,14 @@ class ASTBuilder:
             from .disassembler import disassemble_all
             disassemble_all(class_info, self.ops_mod)
 
-        builder = ASTBuilder(class_info, self.ops_mod)
+        # Build CFG for the class body
+        from .blocks import build_blocks
+        from .cfg import build_cfg
+        class_blocks = build_blocks(class_info.instructions, self.ops_mod)
+        class_info.blocks = class_blocks
+        class_cfg = build_cfg(class_blocks, self.ops_mod)
+
+        builder = ASTBuilder(class_info, self.ops_mod, class_cfg)
         class_body = builder._build_body(class_info.instructions)
         if not class_body:
             class_body = [ast.Pass()]
@@ -871,7 +896,14 @@ class ASTBuilder:
         if not nested_info.instructions:
             disassemble_all(nested_info, self.ops_mod)
 
-        builder = ASTBuilder(nested_info, self.ops_mod)
+        # Build CFG for nested function body
+        from .blocks import build_blocks
+        from .cfg import build_cfg
+        func_blocks = build_blocks(nested_info.instructions, self.ops_mod)
+        nested_info.blocks = func_blocks
+        func_cfg = build_cfg(func_blocks, self.ops_mod)
+
+        builder = ASTBuilder(nested_info, self.ops_mod, func_cfg)
         func_def = builder.build_function()
         # Sanitize function name: handle lambdas, genexprs, listcomps
         # which have names like "Parent.<locals>.<lambda>"
@@ -1028,27 +1060,28 @@ class ASTBuilder:
         return _name_node("<loop_var>")
 
 
-def build_ast(info: CodeObjectInfo, ops_mod: Any) -> ast.Module:
+def build_ast(info: CodeObjectInfo, ops_mod: Any, cfg: Any = None) -> ast.Module:
     """Build an AST module from a decompiled code object.
 
     Args:
         info: The disassembled code object info.
         ops_mod: The opcode module for the Python version.
+        cfg: Optional ControlFlowGraph for structural validation.
 
     Returns:
         An ast.Module node.
     """
-    builder = ASTBuilder(info, ops_mod)
+    builder = ASTBuilder(info, ops_mod, cfg)
     return builder.build_module()
 
 
-def decompile_code_object(info: CodeObjectInfo, ops_mod: Any) -> ast.AST:
+def decompile_code_object(info: CodeObjectInfo, ops_mod: Any, cfg: Any = None) -> ast.AST:
     """Decompile a code object into an AST.
 
     For module-level code, returns ast.Module.
     For function code, returns ast.FunctionDef.
     """
-    builder = ASTBuilder(info, ops_mod)
+    builder = ASTBuilder(info, ops_mod, cfg)
 
     # Check if this is a function/class body or module
     flags = info.co_flags

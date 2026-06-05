@@ -225,6 +225,143 @@ class ControlFlowGraph:
             if block.id in headers:
                 block.is_loop_header = True
 
+    def immediate_dominators(self) -> Dict[int, Optional[int]]:
+        """Compute the immediate dominator for each block.
+
+        Returns a dict mapping block_id → immediate_dominator_id.
+        The entry block's immediate dominator is None.
+        """
+        dom = self._compute_dominators()
+        idom: Dict[int, Optional[int]] = {}
+
+        for block in self.blocks:
+            bid = block.id
+            if block.is_entry:
+                idom[bid] = None
+            else:
+                # Immediate dominator = the node in dom[bid]-{bid}
+                # that is dominated by all other nodes in dom[bid]
+                candidates = dom[bid] - {bid}
+                if not candidates:
+                    # Should not happen for well-structured code;
+                    # fall back to first predecessor
+                    if block.predecessor_ids:
+                        idom[bid] = block.predecessor_ids[0]
+                    else:
+                        idom[bid] = None
+                elif len(candidates) == 1:
+                    idom[bid] = next(iter(candidates))
+                else:
+                    # Pick the candidate that is dominated by all others
+                    found = False
+                    for c in candidates:
+                        if all(d == c or c in dom.get(d, set())
+                               for d in candidates):
+                            idom[bid] = c
+                            found = True
+                            break
+                    if not found:
+                        idom[bid] = next(iter(candidates))
+        return idom
+
+    def post_dominators(self) -> Dict[int, Set[int]]:
+        """Compute post-dominator sets for each block.
+
+        A block P post-dominates block B if all paths from B to the exit
+        must go through P. Computed by running dominator analysis on the
+        reverse CFG (all edges reversed).
+        """
+        if not self.blocks:
+            return {}
+
+        # Find exit blocks (blocks with no successors)
+        exit_blocks = {b.id for b in self.blocks
+                       if not b.successor_ids or b.is_exit}
+
+        all_blocks = {b.id for b in self.blocks}
+
+        # Build reverse CFG: for each edge A→B, add reverse edge B→A
+        reverse_preds: Dict[int, Set[int]] = {}
+        for b in self.blocks:
+            if b.id not in reverse_preds:
+                reverse_preds[b.id] = set()
+            for succ_id in b.successor_ids:
+                if succ_id not in reverse_preds:
+                    reverse_preds[succ_id] = set()
+                reverse_preds[succ_id].add(b.id)
+
+        # If no exit blocks found, use the last block
+        actual_exits = exit_blocks or {self.blocks[-1].id}
+
+        # Iterative dataflow on reverse graph
+        pdom: Dict[int, Set[int]] = {}
+        for b in self.blocks:
+            if b.id in actual_exits:
+                pdom[b.id] = {b.id}
+            else:
+                pdom[b.id] = all_blocks.copy()
+
+        changed = True
+        while changed:
+            changed = False
+            for b in self.blocks:
+                if b.id in actual_exits:
+                    continue
+                succs = b.successor_ids
+                if not succs:
+                    # Dead-end block: skip or set to itself
+                    new_pdom = {b.id}
+                else:
+                    new_pdom = all_blocks.copy()
+                    for sid in succs:
+                        new_pdom &= pdom.get(sid, {sid})
+                new_pdom.add(b.id)
+                if new_pdom != pdom[b.id]:
+                    pdom[b.id] = new_pdom
+                    changed = True
+
+        return pdom
+
+    def get_loop_body(self, header_id: int) -> Set[int]:
+        """Return the set of block IDs in the natural loop of a header.
+
+        Natural loop: all blocks dominated by the header that have a path
+        to at least one predecessor of the header without going through
+        the header itself.
+        """
+        if header_id >= len(self.blocks):
+            return set()
+
+        header = self.blocks[header_id]
+        dom = self._compute_dominators()
+
+        # Find latch blocks: predecessors of header dominated by header
+        latches = {pid for pid in header.predecessor_ids
+                   if header_id in dom.get(pid, set())}
+
+        if not latches:
+            return set()
+
+        # Breadth-first backward search from latches
+        # All blocks reached without going through header
+        body: Set[int] = set()
+        worklist = list(latches)
+        visited = set()
+        while worklist:
+            bid = worklist.pop()
+            if bid in visited or bid == header_id:
+                continue
+            visited.add(bid)
+            # Must be dominated by header to be in the loop
+            if bid in dom and header_id in dom[bid]:
+                body.add(bid)
+                block = self.blocks[bid]
+                for pid in block.predecessor_ids:
+                    if pid not in visited and pid != header_id:
+                        worklist.append(pid)
+
+        return body
+
 
 def build_cfg(blocks: List[BasicBlock], ops_mod: Any) -> ControlFlowGraph:
     """Build a control flow graph from basic blocks."""
