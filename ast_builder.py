@@ -72,6 +72,13 @@ class ASTBuilder:
         args = self._build_args()
         return ast.Lambda(args=args, body=body_expr)
 
+    def _find_block_for(self, offset: int) -> int:
+        """Find block ID containing the given bytecode offset."""
+        for b in self.blocks:
+            if b.start_offset <= offset <= b.end_offset:
+                return b.id
+        return -1
+
     def _sanitize_name(self, name: str) -> str:
         """Sanitize a Python identifier name (fixes genexpr .0, etc.)."""
         if not name:
@@ -148,13 +155,37 @@ class ASTBuilder:
         return []
 
     def _build_body(self, instructions: List[Instruction]) -> List[ast.stmt]:
-        """Build a list of AST statements from a linear instruction sequence."""
+        """Build a list of AST statements from a linear instruction sequence.
+
+        Uses BlockStackSimulator to pre-compute per-block entry states,
+        resetting the persistent simulator at each block boundary for
+        correct stack state propagation across control flow.
+        """
+        # Pre-compute per-block entry states when blocks are available
+        block_entries: Dict[int, List[ast.AST]] = {}
+        if self.blocks and len(self.blocks) > 1:
+            try:
+                from .stack_sim import BlockStackSimulator
+                bsim = BlockStackSimulator(self.info, self.blocks, self._idom)
+                bsim.simulate_all()
+                block_entries = {bid: list(st) for bid, st
+                                 in bsim._entry_states.items() if st is not None}
+            except Exception:
+                pass
+
         stmts: List[ast.stmt] = []
         sim = StackSimulator(self.info)
+        last_block_id = -1
 
         i = 0
         while i < len(instructions):
             instr = instructions[i]
+
+            # Reset stack at block boundary using pre-computed entry state
+            curr_block_id = self._find_block_for(instr.offset)
+            if curr_block_id != last_block_id and curr_block_id in block_entries:
+                sim.stack = list(block_entries[curr_block_id])
+                last_block_id = curr_block_id
 
             # Try to match structure patterns
             result = self._match_if_statement(instructions, i)
