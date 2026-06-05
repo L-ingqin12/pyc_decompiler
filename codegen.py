@@ -85,6 +85,20 @@ def _fallback_unparse(node: ast.AST) -> str:
         func_str = _fallback_unparse(node.func)
         args_str = ", ".join(_fallback_unparse(a) for a in node.args)
         return f"{func_str}({args_str})"
+    if isinstance(node, ast.List):
+        elts = ", ".join(_fallback_unparse(e) for e in node.elts)
+        return f"[{elts}]"
+    if isinstance(node, ast.Tuple):
+        elts = ", ".join(_fallback_unparse(e) for e in node.elts)
+        return f"({elts})"
+    if isinstance(node, ast.Dict):
+        pairs = []
+        for k, v in zip(node.keys, node.values):
+            pairs.append(f"{_fallback_unparse(k)}: {_fallback_unparse(v)}")
+        return "{" + ", ".join(pairs) + "}"
+    if isinstance(node, ast.Set):
+        elts = ", ".join(_fallback_unparse(e) for e in node.elts)
+        return "{" + elts + "}"
     if isinstance(node, ast.ClassDef):
         body = node.body if node.body else [ast.Pass()]
         body_str = "\n".join(
@@ -135,12 +149,15 @@ def _fallback_unparse(node: ast.AST) -> str:
         return f"{_fallback_unparse(node.value)}[{_fallback_unparse(node.slice)}]"
     if isinstance(node, ast.Slice):
         parts = []
-        if node.lower:
-            parts.append(_fallback_unparse(node.lower))
-        if node.upper:
-            parts.append(_fallback_unparse(node.upper))
-        if node.step:
-            parts.append(_fallback_unparse(node.step))
+        lower = getattr(node, 'lower', None)
+        upper = getattr(node, 'upper', None)
+        step = getattr(node, 'step', None)
+        if lower:
+            parts.append(_fallback_unparse(lower))
+        if upper:
+            parts.append(_fallback_unparse(upper))
+        if step:
+            parts.append(_fallback_unparse(step))
         return ":".join(parts)
     if isinstance(node, ast.UnaryOp):
         op = {ast.USub: '-', ast.UAdd: '+', ast.Not: 'not ', ast.Invert: '~'}.get(type(node.op), '?')

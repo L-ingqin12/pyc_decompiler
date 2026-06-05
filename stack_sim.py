@@ -241,8 +241,9 @@ class StackSimulator:
             ))
 
         elif opname == "STORE_SUBSCR":
-            obj = self.pop()
+            # Stack: [value, container, key] (TOS=key)
             key = self.pop()
+            obj = self.pop()
             val = self.pop()
             stmts.append(ast.Assign(
                 targets=[ast.Subscript(
@@ -499,10 +500,41 @@ class StackSimulator:
                 stop = self.pop()
                 start = self.pop()
                 self.push(ast.Slice(lower=start, upper=stop, step=step))
-            else:
+            elif arg == 2:
                 stop = self.pop()
                 start = self.pop()
                 self.push(ast.Slice(lower=start, upper=stop))
+            else:
+                # arg == 0: just a slice marker, or unknown form
+                pass
+
+        elif opname == "BINARY_SLICE":
+            # Python 3.12+: pops TOS(stop), TOS1(start), TOS2(container),
+            # pushes container[start:stop] as a combined slice+subscript
+            stop = self.pop()
+            start = self.pop()
+            container = self.pop()
+            self.push(ast.Subscript(
+                value=container,
+                slice=ast.Slice(lower=start, upper=stop),
+                ctx=ast.Load(),
+            ))
+
+        elif opname == "STORE_SLICE":
+            # Python 3.12+: container[start:stop] = value
+            # Stack: [value, container, start, stop] (TOS=stop)
+            stop = self.pop()
+            start = self.pop()
+            container = self.pop()
+            val = self.pop()
+            stmts.append(ast.Assign(
+                targets=[ast.Subscript(
+                    value=container,
+                    slice=ast.Slice(lower=start, upper=stop),
+                    ctx=ast.Store(),
+                )],
+                value=val,
+            ))
 
         # --- Unpacking ---
         elif opname == "UNPACK_SEQUENCE":
