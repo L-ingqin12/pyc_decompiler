@@ -213,7 +213,7 @@ class ASTBuilder:
                 last_block_id = curr_block_id
 
             # Try to match structure patterns
-            result = self._match_if_statement(instructions, i)
+            result = self._match_if_statement(instructions, i, sim)
             if result:
                 stmts.append(result[0])
                 i = result[1]
@@ -315,6 +315,9 @@ class ASTBuilder:
                     else:
                         break
                 elif isinstance(v, ast.Call):
+                    # Method calls (obj.method()) are valid statements
+                    if isinstance(v.func, ast.Attribute):
+                        break  # keep method calls
                     # Bare function calls without assignment are often junk
                     stmts.pop()
                 elif isinstance(v, ast.BinOp):
@@ -445,7 +448,8 @@ class ASTBuilder:
         return target_idx
 
     def _match_if_statement(
-        self, instrs: List[Instruction], start: int
+        self, instrs: List[Instruction], start: int,
+        sim: Optional[StackSimulator] = None,
     ) -> Optional[Tuple[ast.If, int]]:
         """Match if/elif/else patterns.
 
@@ -468,27 +472,53 @@ class ASTBuilder:
         if else_target is None:
             return None
 
-        # Compute condition from instructions BEFORE the POP_JUMP_IF_FALSE.
-        # _compute_expression simulates up to (exclusive) the given index.
-        test = self._compute_expression(instrs, start) if start > 0 else ast.Constant(value=None)
+        # Condition is on the persistent simulator's stack
+        if sim is not None and sim.stack:
+            test = sim.stack.pop()
+        elif start > 0:
+            test = self._compute_expression(instrs, start)
+        else:
+            test = ast.Constant(value=None)
+
+        # Determine if else_target is within our instruction scope.
+        # In child builders, jump targets may point outside the subset
+        # (e.g., to the parent loop's FOR_ITER). In that case, the
+        # "else" path is out of scope and we only decompile the true body.
+        min_offset = instrs[0].offset if instrs else 0
+        max_offset = instrs[-1].offset if instrs else 0
+        target_in_scope = (min_offset <= else_target <= max_offset)
 
         # Collect true body instructions: from start+1 until else_target
         true_instrs = []
         true_body_end = start + 1
-        for j in range(start + 1, len(instrs)):
-            jinstr = instrs[j]
-            if jinstr.offset >= else_target:
-                true_body_end = j
-                break
-            # Check for JUMP_FORWARD that jumps past else_target (indicates else/elif)
-            if jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
-                tgt = jinstr.target_offset
-                if tgt is not None and tgt > else_target:
+        if target_in_scope:
+            for j in range(start + 1, len(instrs)):
+                jinstr = instrs[j]
+                if jinstr.offset >= else_target:
                     true_body_end = j
                     break
-            true_instrs.append(jinstr)
+                if jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
+                    tgt = jinstr.target_offset
+                    if tgt is not None and tgt > else_target:
+                        true_body_end = j
+                        break
+                true_instrs.append(jinstr)
+            else:
+                true_body_end = len(instrs)
         else:
-            true_body_end = len(instrs)
+            # Target is outside scope → all remaining instructions are
+            # the true body (fallthrough). The else path is unreachable
+            # in this decompilation context.
+            for j in range(start + 1, len(instrs)):
+                jinstr = instrs[j]
+                if jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
+                    tgt = jinstr.target_offset
+                    if tgt is not None and tgt > max_offset:
+                        true_body_end = j
+                        break
+                true_instrs.append(jinstr)
+            else:
+                true_body_end = len(instrs)
 
         # Build true body with child builder
         if true_instrs:
@@ -499,28 +529,15 @@ class ASTBuilder:
 
         # Build else/elif body
         orelse = []
-        end_target = else_target
         next_start = true_body_end
 
-        # Check if there's an else/elif body between else_target and end_target
-        # Find the end of the entire if/elif/else chain
-        for j in range(true_body_end, len(instrs)):
-            jinstr = instrs[j]
-            if jinstr.offset >= else_target and jinstr.opname not in {
-                "JUMP_FORWARD", "JUMP_ABSOLUTE", "POP_BLOCK",
-                "RETURN_VALUE", "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
-            }:
-                # Check if this is part of else body
-                pass
-
-        # Collect else/elif instructions
-        orelse_instrs = []
-        orelse_end = true_body_end
-        if true_body_end < len(instrs):
+        if target_in_scope and true_body_end < len(instrs):
+            # Collect else/elif instructions between else_target and end of scope
+            orelse_instrs = []
+            orelse_end = true_body_end
             first_after = instrs[true_body_end]
             if (first_after.offset >= else_target
                     or first_after.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}):
-                # Find the end of else block
                 jump_tgt = first_after.target_offset if first_after.opname in {
                     "JUMP_FORWARD", "JUMP_ABSOLUTE"} else None
                 orelse_start = true_body_end + (1 if first_after.opname in {
@@ -538,12 +555,7 @@ class ASTBuilder:
                     else_child = self._create_child_builder(orelse_instrs)
                     orelse = else_child._build_body(orelse_instrs)
                     next_start = orelse_end
-                else:
-                    next_start = true_body_end
-            else:
-                next_start = true_body_end
-        else:
-            next_start = true_body_end
+        # If target is out of scope, there is no else body to decompile
 
         return ast.If(test=test, body=true_body, orelse=orelse), next_start
 

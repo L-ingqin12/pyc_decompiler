@@ -256,7 +256,12 @@ class StackSimulator:
 
         # --- Stack manipulation ---
         elif opname == "POP_TOP":
-            self.pop()  # discard; may represent expression statement
+            val = self.pop()  # discard; may represent expression statement
+            # If the popped value is a method call (obj.method()), emit it
+            # as a statement. POP_TOP after CALL_METHOD is commonly used for
+            # void method calls like list.append() or list.sort().
+            if isinstance(val, ast.Call) and isinstance(val.func, ast.Attribute):
+                stmts.append(ast.Expr(value=val))
 
         elif opname == "DUP_TOP":
             self.dup_top()
