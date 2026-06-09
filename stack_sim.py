@@ -708,14 +708,19 @@ class StackSimulator:
         elif opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE", "JUMP_BACKWARD",
                         "FOR_ITER", "SETUP_FINALLY", "SETUP_EXCEPT",
                         "SETUP_WITH", "SETUP_ASYNC_WITH", "SETUP_LOOP",
-                        "BREAK_LOOP", "CONTINUE_LOOP", "POP_BLOCK",
-                        "POP_EXCEPT", "END_FINALLY", "BEGIN_FINALLY",
-                        "CALL_FINALLY", "POP_FINALLY",
+                        "POP_BLOCK", "POP_EXCEPT", "END_FINALLY",
+                        "BEGIN_FINALLY", "CALL_FINALLY", "POP_FINALLY",
                         "SETUP_ANNOTATIONS", "NOP", "EXTENDED_ARG",
                         "RETURN_GENERATOR", "PRINT_EXPR",
                         "LIST_TO_TUPLE", "WITH_CLEANUP_START",
                         "WITH_CLEANUP_FINISH"}:
             pass
+
+        elif opname == "BREAK_LOOP":
+            stmts.append(ast.Break())
+
+        elif opname == "CONTINUE_LOOP":
+            stmts.append(ast.Continue())
 
         # --- Conditional jumps with stack effect ---
         elif opname in {"POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"}:

@@ -51,7 +51,8 @@ class Instruction:
     def target_offset(self) -> Optional[int]:
         """Target offset for jump instructions, if computable."""
         if self.opname in {"JUMP_FORWARD", "SETUP_FINALLY", "SETUP_EXCEPT",
-                           "SETUP_WITH", "SETUP_ASYNC_WITH", "FOR_ITER"}:
+                           "SETUP_WITH", "SETUP_ASYNC_WITH", "FOR_ITER",
+                           "SETUP_LOOP"}:
             return self.offset + 2 + self.arg
         elif self.opname in {"JUMP_ABSOLUTE", "POP_JUMP_IF_FALSE",
                              "POP_JUMP_IF_TRUE", "JUMP_IF_FALSE_OR_POP",

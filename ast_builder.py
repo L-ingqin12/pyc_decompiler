@@ -44,6 +44,31 @@ class ASTBuilder:
         else:
             self._idom = {}
 
+    def _create_child_builder(
+        self, instructions: List[Instruction],
+    ) -> ASTBuilder:
+        """Create a child ASTBuilder for processing a nested structure's body.
+
+        Rebuilds the CFG and blocks for the body instruction subset so that
+        recursive _build_body calls have correct control-flow context.
+
+        This is the key fix for nested control flow reconstruction:
+        without it, recursive _build_body calls use the parent's blocks
+        and CFG, which don't match the instruction subset.
+        """
+        from .blocks import build_blocks
+        from .cfg import build_cfg
+
+        child_blocks = build_blocks(instructions, self.ops_mod)
+        child_cfg = build_cfg(child_blocks, self.ops_mod)
+
+        child = ASTBuilder(self.info, self.ops_mod, child_cfg)
+        child.blocks = child_blocks
+        # Cache loop headers for the child
+        child._loop_headers = child_cfg.find_loop_headers() if child_cfg else None
+        child._idom = child_cfg.immediate_dominators() if child_cfg else {}
+        return child
+
     def build_module(self) -> ast.Module:
         """Build an ast.Module from the top-level code object."""
         body = self._build_body(self.instructions)
@@ -465,9 +490,11 @@ class ASTBuilder:
         else:
             true_body_end = len(instrs)
 
-        # Build true body
-        true_body = self._build_body(true_instrs)
-        if not true_body:
+        # Build true body with child builder
+        if true_instrs:
+            child = self._create_child_builder(true_instrs)
+            true_body = child._build_body(true_instrs)
+        else:
             true_body = [ast.Pass()]
 
         # Build else/elif body
@@ -508,7 +535,8 @@ class ASTBuilder:
                     orelse_end = len(instrs)
 
                 if orelse_instrs:
-                    orelse = self._build_body(orelse_instrs)
+                    else_child = self._create_child_builder(orelse_instrs)
+                    orelse = else_child._build_body(orelse_instrs)
                     next_start = orelse_end
                 else:
                     next_start = true_body_end
@@ -587,21 +615,27 @@ class ASTBuilder:
                 body_start += 1  # skip STORE_FAST loop_var
 
         # ── Extract body instructions ──────────────────────────────────
-        # Body: from body_start to the first instruction at exit_target
-        # EXCLUDING the terminal JUMP_ABSOLUTE (back edge)
+        # Body: from body_start to the first instruction at exit_target.
+        # Inner back-edges (from nested while/for loops) are INCLUDED in
+        # the body. Only the FOR loop's OWN back-edge (targeting FOR_ITER
+        # or earlier) marks the body end.
         body_instrs = []
         body_end = body_start
+        for_iter_offset = instrs[for_iter_idx].offset
         for j in range(body_start, len(instrs)):
             jinstr = instrs[j]
             if jinstr.offset >= exit_target:
                 body_end = j
                 break
             if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
-                # Back edge — this is the end of the body
-                body_instrs = [ins for ins in instrs[body_start:j]
-                              if ins.offset < exit_target]
-                body_end = j + 1
-                break
+                tgt = jinstr.target_offset
+                # Only stop for the for loop's own back-edge (targets
+                # FOR_ITER or earlier). Inner back-edges skip forward.
+                if tgt is not None and tgt <= for_iter_offset:
+                    body_instrs = [ins for ins in instrs[body_start:j]
+                                  if ins.offset < exit_target]
+                    body_end = j + 1
+                    break
         else:
             body_instrs = [ins for ins in instrs[body_start:body_end]
                           if ins.offset < exit_target]
@@ -628,7 +662,13 @@ class ASTBuilder:
         # Build AST — _compute_expression simulates up to (exclusive) get_iter_idx
         iter_expr = self._compute_expression(instrs, get_iter_idx)
         target = self._compute_loop_target(instrs, for_iter_idx)
-        body = self._build_body(body_instrs) if body_instrs else [ast.Pass()]
+
+        # Use child builder with proper CFG for nested body
+        if body_instrs:
+            child = self._create_child_builder(body_instrs)
+            body = child._build_body(body_instrs)
+        else:
+            body = [ast.Pass()]
 
         return ast.For(
             target=target,
@@ -643,75 +683,161 @@ class ASTBuilder:
     ) -> Optional[Tuple[Union[ast.While, ast.For], int]]:
         """Match while loop patterns.
 
-        A while loop has a backward jump from the body to the condition.
-        If there's no backward jump, it's an if statement (handled elsewhere).
+        Two patterns, checked in order:
 
-        When CFG data is available, validates against loop headers detected
-        by dominator-based back-edge analysis for extra confidence.
+        1. while True: (no POP_JUMP_IF_FALSE at top — body starts immediately)
+           SETUP_LOOP <end_target>
+           ... body (starts right after SETUP_LOOP) ...
+           JUMP_ABSOLUTE <body_start>    (back edge)
+           ... BREAK_LOOP in body ...
+           POP_BLOCK
+           end_target:
+
+        2. Normal while with condition:
+           SETUP_LOOP <end_target>
+           ... condition ...
+           POP_JUMP_IF_FALSE <end_target>
+           ... body ...
+           JUMP_ABSOLUTE <loop_start>    (back edge)
         """
         if start >= len(instrs):
             return None
 
-        # While loops start with SETUP_LOOP in 3.7
-        i = start
-        setup_target = None
-        if instrs[i].opname == "SETUP_LOOP":
-            setup_target = instrs[i].target_offset
-            i += 1
-
-        # The condition is evaluated, then POP_JUMP_IF_FALSE
-        cond_end = None
-        cond_target = None
-        for j in range(i, len(instrs)):
-            if instrs[j].opname == "POP_JUMP_IF_FALSE":
-                target = instrs[j].target_offset
-                if target and target > instrs[j].offset:
-                    cond_end = j
-                    cond_target = target
-                    break
-
-        if cond_end is None:
+        instr_start = instrs[start]
+        if instr_start.opname != "SETUP_LOOP":
             return None
 
-        # Find the backward jump that defines this as a while loop.
-        body_instrs = []
-        body_end = cond_end + 1
-        has_backward = False
-        for j in range(cond_end + 1, len(instrs)):
-            jinstr = instrs[j]
-            loop_end_target = setup_target or cond_target
-            if (loop_end_target is not None
-                    and jinstr.offset >= loop_end_target
-                    and jinstr.opname not in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}):
-                break
-            if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
-                tgt = jinstr.target_offset
-                if tgt is not None and tgt < instrs[start].offset:
-                    has_backward = True
-                    body_instrs = instrs[cond_end + 1:j]
-                    body_end = j + 1
-                    break
+        setup_target = instr_start.target_offset
+        if setup_target is None:
+            return None
 
-        # If CFG available, cross-check: if this block is NOT a loop header
-        # (no back-edge detected by dominator analysis), it's likely an if.
-        if self._loop_headers is not None and has_backward:
-            # Find which basic block the loop header is in
-            for block in self.blocks:
-                if block.start_offset <= instrs[start].offset <= block.end_offset:
-                    if block.id not in self._loop_headers:
-                        # CFG says this is NOT a loop — trust the CFG
-                        has_backward = False
+        setup_offset = instr_start.offset
+        body_start_offset = setup_offset + 2  # after SETUP_LOOP instruction
+
+        # ── Determine if this is while True or normal while ────────────
+        # while True: the body begins immediately after SETUP_LOOP.
+        # Normal while: condition computation → POP_JUMP_IF_FALSE → body.
+        is_while_true = True
+        cond_end = None
+        cond_target = None
+
+        if start + 1 < len(instrs):
+            next_instr = instrs[start + 1]
+            # If the very next instruction is a POP_JUMP_IF_FALSE, it's a
+            # normal while (the condition was computed before SETUP_LOOP at
+            # the loop back-edge).
+            # If next is LOAD_FAST/STORE_FAST/LOAD_CONST (computation), it's
+            # while True — the body starts right away.
+            if next_instr.opname == "POP_JUMP_IF_FALSE":
+                is_while_true = False
+                cond_end = start + 1
+                cond_target = next_instr.target_offset
+            elif next_instr.opname in {
+                "LOAD_FAST", "LOAD_CONST", "LOAD_GLOBAL", "LOAD_ATTR",
+                "STORE_FAST", "BUILD_TUPLE", "BUILD_LIST",
+            }:
+                is_while_true = True
+            else:
+                # Uncertain — check if there's a POP_JUMP_IF_FALSE nearby
+                for j in range(start + 1, min(start + 8, len(instrs))):
+                    if instrs[j].opname == "POP_JUMP_IF_FALSE":
+                        is_while_true = False
+                        cond_end = j
+                        cond_target = instrs[j].target_offset
+                        break
+
+        # ── Find the back-edge and body ───────────────────────────────
+        body_instrs = []
+        body_end = start + 1
+        has_backward = False
+
+        if is_while_true:
+            # while True: find back-edge that jumps to body start
+            for j in range(start + 1, len(instrs)):
+                jinstr = instrs[j]
+                if (jinstr.offset >= setup_target
+                        and jinstr.opname not in {"JUMP_ABSOLUTE", "JUMP_BACKWARD", "BREAK_LOOP"}):
                     break
+                if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
+                    tgt = jinstr.target_offset
+                    # Back-edge for while True: jumps to body_start_offset
+                    if tgt is not None and tgt >= body_start_offset and tgt < jinstr.offset:
+                        # BREAK_LOOP may appear AFTER the back-edge.
+                        # Scan forward from j to find it.
+                        break_idx = None
+                        for k in range(j + 1, min(j + 5, len(instrs))):
+                            if instrs[k].opname == "BREAK_LOOP":
+                                break_idx = k
+                                break
+                            if instrs[k].offset >= setup_target:
+                                break
+                        # Also check before the back-edge
+                        has_break = any(
+                            ik.opname == "BREAK_LOOP"
+                            for ik in instrs[start + 1:j]
+                        )
+                        if has_break or break_idx is not None:
+                            has_backward = True
+                            end_j = break_idx + 1 if break_idx is not None else j + 1
+                            # Extend to include POP_BLOCK if it follows BREAK_LOOP
+                            if end_j < len(instrs) and instrs[end_j].opname == "POP_BLOCK":
+                                end_j += 1
+                            body_instrs = instrs[start + 1:j]  # body up to back-edge
+                            # Also include BREAK_LOOP+POP_BLOCK cleanup
+                            if break_idx is not None:
+                                body_instrs += instrs[j:end_j]
+                            body_end = end_j
+                            break
+        else:
+            # Normal while with condition
+            for j in range(cond_end + 1 if cond_end is not None else start + 1, len(instrs)):
+                jinstr = instrs[j]
+                loop_end_target = setup_target or cond_target
+                if (loop_end_target is not None
+                        and jinstr.offset >= loop_end_target
+                        and jinstr.opname not in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}):
+                    break
+                if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
+                    tgt = jinstr.target_offset
+                    if tgt is not None and tgt < setup_offset:
+                        has_backward = True
+                        body_instrs = instrs[cond_end + 1:j]
+                        body_end = j + 1
+                        break
+
+        # Validate with CFG — also check successor blocks since for
+        # while True the loop header is the body entry block (after SETUP_LOOP),
+        # not the SETUP_LOOP block itself.
+        if self._loop_headers is not None and has_backward:
+            found_header = False
+            for block in self.blocks:
+                if block.start_offset <= setup_offset <= block.end_offset:
+                    if block.id in self._loop_headers:
+                        found_header = True
+                    else:
+                        # Check if any successor is a loop header
+                        for sid in block.successor_ids:
+                            if sid in self._loop_headers:
+                                found_header = True
+                                break
+                    break
+            if not found_header:
+                has_backward = False
 
         if not has_backward:
             return None
 
-        # Build test expression — _compute_expression stops before cond_end
-        # (the POP_JUMP_IF_FALSE), recovering the condition on the stack.
-        test = self._compute_expression(instrs, cond_end)
+        # Build test expression
+        if is_while_true:
+            test = ast.Constant(value=True)
+        else:
+            test = self._compute_expression(instrs, cond_end)
 
-        body = self._build_body(body_instrs)
-        if not body:
+        # Use child builder with proper CFG for nested body
+        if body_instrs:
+            child = self._create_child_builder(body_instrs)
+            body = child._build_body(body_instrs)
+        else:
             body = [ast.Pass()]
 
         return ast.While(test=test, body=body, orelse=[]), body_end
@@ -766,11 +892,17 @@ class ASTBuilder:
                 try_end_idx = j
                 break
 
-        # Build try body
+        # Build try body with child builder
         if pop_block_idx is not None and pop_block_idx > start + 1:
-            try_body = self._build_body(instrs[start + 1:pop_block_idx])
+            try_instrs = instrs[start + 1:pop_block_idx]
         elif try_end_idx > start + 1:
-            try_body = self._build_body(instrs[start + 1:try_end_idx])
+            try_instrs = instrs[start + 1:try_end_idx]
+        else:
+            try_instrs = []
+
+        if try_instrs:
+            try_child = self._create_child_builder(try_instrs)
+            try_body = try_child._build_body(try_instrs)
         else:
             try_body = [ast.Pass()]
 
@@ -842,7 +974,12 @@ class ASTBuilder:
                 break
         body_instrs = body_instrs[:cut]
 
-        handler_body = self._build_body(body_instrs) if body_instrs else [ast.Pass()]
+        # Use child builder for handler body
+        if body_instrs:
+            handler_child = self._create_child_builder(body_instrs)
+            handler_body = handler_child._build_body(body_instrs)
+        else:
+            handler_body = [ast.Pass()]
 
         is_finally = (instr.opname == "SETUP_FINALLY")
 
