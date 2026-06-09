@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from .types import ModuleInfo, DecompileResult
+from .pyc_types import ModuleInfo, DecompileResult
 
 
 def write_output(

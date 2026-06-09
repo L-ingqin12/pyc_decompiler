@@ -13,7 +13,7 @@ import subprocess
 import types
 from typing import Any, Tuple
 
-from .types import CodeObjectInfo
+from .pyc_types import CodeObjectInfo
 
 
 def _find_python(version: Tuple[int, int]) -> str | None:

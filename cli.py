@@ -17,7 +17,7 @@ from .cfg import build_cfg
 from .ast_builder import build_ast
 from .codegen import generate_source
 from .writer import ProjectWriter, print_summary
-from .types import ModuleInfo, DecompileResult
+from .pyc_types import ModuleInfo, DecompileResult
 
 
 def decompile_file(

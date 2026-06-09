@@ -68,8 +68,16 @@ def _format_source(source: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _indent_lines(text: str, spaces: int = 4) -> str:
+    """Indent all lines of *text* by *spaces* spaces."""
+    ind = " " * spaces
+    return ind + text.replace("\n", "\n" + ind)
+
+
 def _fallback_unparse(node: ast.AST) -> str:
     """Fallback AST pretty-printer for Python < 3.9."""
+    body_indent = "    "
+
     # Very basic fallback — won't happen on Python 3.12 host
     if isinstance(node, ast.Module):
         return "\n".join(
@@ -104,15 +112,15 @@ def _fallback_unparse(node: ast.AST) -> str:
         if node.bases:
             bases_str = "(" + ", ".join(_fallback_unparse(b) for b in node.bases) + ")"
         body = node.body if node.body else [ast.Pass()]
-        body_str = "\n".join(
-            "    " + _fallback_unparse(s) for s in body
-        )
+        body_lines = []
+        for s in body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        body_str = "\n".join(body_lines)
         if not body_str.strip():
             body_str = "    pass"
         return f"class {node.name}{bases_str}:\n{body_str}"
     if isinstance(node, ast.FunctionDef):
         args = node.args
-        # Build argument string manually
         parts = []
         for a in args.args:
             parts.append(a.arg)
@@ -124,9 +132,10 @@ def _fallback_unparse(node: ast.AST) -> str:
             parts.append(f"**{args.kwarg.arg}")
         args_str = ", ".join(parts)
         body = node.body if node.body else [ast.Pass()]
-        body_str = "\n".join(
-            "    " + _fallback_unparse(s) for s in body
-        )
+        body_lines = []
+        for s in body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        body_str = "\n".join(body_lines)
         if not body_str.strip():
             body_str = "    pass"
         return f"def {node.name}({args_str}):\n{body_str}"
@@ -184,11 +193,16 @@ def _fallback_unparse(node: ast.AST) -> str:
         return f"({left} {op} {right})"
     if isinstance(node, ast.If):
         test = _fallback_unparse(node.test)
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        body = "\n".join(body_lines)
         result = f"if {test}:\n{body}"
         if node.orelse:
-            else_body = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
-            result += f"\nelse:\n{else_body}"
+            else_lines = []
+            for s in node.orelse:
+                else_lines.append(_indent_lines(_fallback_unparse(s)))
+            result += f"\nelse:\n" + "\n".join(else_lines)
         return result
     if isinstance(node, ast.AugAssign):
         target = _fallback_unparse(node.target)
@@ -197,34 +211,45 @@ def _fallback_unparse(node: ast.AST) -> str:
         return f"{target} {op}= {value}"
     if isinstance(node, ast.FormattedValue):
         val = _fallback_unparse(node.value)
-        conv = {0: '', 1: '!s', 2: '!r', 3: '!a'}.get(node.conversion, '')
+        conv_map = {-1: '', 0: '', 1: '!s', 2: '!r', 3: '!a'}
+        conv = conv_map.get(node.conversion, '')
         fmt = f":{_fallback_unparse(node.format_spec)}" if node.format_spec else ''
         return f"{{{val}{conv}{fmt}}}"
     if isinstance(node, ast.JoinedStr):
-        parts = ''.join(
-            _fallback_unparse(v) if isinstance(v, ast.FormattedValue)
-            else v.value if isinstance(v, ast.Constant) else str(v)
-            for v in node.values
-        )
-        return f"f'{parts}'"
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.FormattedValue):
+                parts.append(_fallback_unparse(v))
+            elif isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            else:
+                parts.append(_fallback_unparse(v))
+        return "f'" + "".join(parts) + "'"
     if isinstance(node, ast.Try):
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
-        result = f"try:\n{body}"
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        result = "try:\n" + "\n".join(body_lines)
         for h in node.handlers:
-            handler = _fallback_unparse(h)
-            result += f"\n{handler}"
+            result += "\n" + _fallback_unparse(h)
         if node.orelse:
-            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
-            result += f"\nelse:\n{orelse}"
+            else_lines = []
+            for s in node.orelse:
+                else_lines.append(_indent_lines(_fallback_unparse(s)))
+            result += "\nelse:\n" + "\n".join(else_lines)
         if node.finalbody:
-            fb = "\n".join("    " + _fallback_unparse(s) for s in node.finalbody)
-            result += f"\nfinally:\n{fb}"
+            fb_lines = []
+            for s in node.finalbody:
+                fb_lines.append(_indent_lines(_fallback_unparse(s)))
+            result += "\nfinally:\n" + "\n".join(fb_lines)
         return result
     if isinstance(node, ast.ExceptHandler):
         t = _fallback_unparse(node.type) if node.type else ''
         name = f" as {node.name}" if node.name else ''
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
-        return f"except {t}{name}:\n{body}"
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        return f"except {t}{name}:\n" + "\n".join(body_lines)
     if isinstance(node, ast.Raise):
         exc = _fallback_unparse(node.exc) if node.exc else ''
         cause = f" from {_fallback_unparse(node.cause)}" if node.cause else ''
@@ -234,19 +259,27 @@ def _fallback_unparse(node: ast.AST) -> str:
     if isinstance(node, ast.For):
         target = _fallback_unparse(node.target)
         iter_ = _fallback_unparse(node.iter)
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
-        result = f"for {target} in {iter_}:\n{body}"
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        result = f"for {target} in {iter_}:\n" + "\n".join(body_lines)
         if node.orelse:
-            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
-            result += f"\nelse:\n{orelse}"
+            else_lines = []
+            for s in node.orelse:
+                else_lines.append(_indent_lines(_fallback_unparse(s)))
+            result += "\nelse:\n" + "\n".join(else_lines)
         return result
     if isinstance(node, ast.While):
         test = _fallback_unparse(node.test)
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
-        result = f"while {test}:\n{body}"
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        result = f"while {test}:\n" + "\n".join(body_lines)
         if node.orelse:
-            orelse = "\n".join("    " + _fallback_unparse(s) for s in node.orelse)
-            result += f"\nelse:\n{orelse}"
+            else_lines = []
+            for s in node.orelse:
+                else_lines.append(_indent_lines(_fallback_unparse(s)))
+            result += "\nelse:\n" + "\n".join(else_lines)
         return result
     if isinstance(node, ast.With):
         items = ", ".join(
@@ -254,8 +287,10 @@ def _fallback_unparse(node: ast.AST) -> str:
             + (f" as {_fallback_unparse(it.optional_vars)}" if it.optional_vars else '')
             for it in node.items
         )
-        body = "\n".join("    " + _fallback_unparse(s) for s in node.body)
-        return f"with {items}:\n{body}"
+        body_lines = []
+        for s in node.body:
+            body_lines.append(_indent_lines(_fallback_unparse(s)))
+        return f"with {items}:\n" + "\n".join(body_lines)
     if isinstance(node, ast.Starred):
         return f"*{_fallback_unparse(node.value)}"
     if isinstance(node, ast.Yield):

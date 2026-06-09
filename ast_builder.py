@@ -21,7 +21,7 @@ from __future__ import annotations
 import ast
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from .types import Instruction, BasicBlock, CodeObjectInfo
+from .pyc_types import Instruction, BasicBlock, CodeObjectInfo
 from .stack_sim import StackSimulator, _name_node, _const_node, _attr_node
 from .opcodes.base import CMP_OP
 
@@ -244,6 +244,8 @@ class ASTBuilder:
 
         # Flush remaining stack as expression statements.
         # Only emit "top-level" nodes that look like complete expressions.
+        # Suppress junk from broken chained comparison / short-circuit recovery.
+        fn_params = set(self.info.co_varnames[:self.info.co_argcount])
         for expr in sim.stack:
             if isinstance(expr, ast.Constant):
                 if expr.value is None:
@@ -251,8 +253,13 @@ class ASTBuilder:
             if isinstance(expr, ast.Attribute):
                 if isinstance(expr.attr, str) and expr.attr.startswith('<'):
                     continue
-            if isinstance(expr, ast.Name) and isinstance(expr.id, str) and expr.id.startswith('<'):
-                continue
+            if isinstance(expr, ast.Name):
+                if isinstance(expr.id, str) and expr.id.startswith('<'):
+                    continue
+                # Suppress lone parameter names (leftover from DUP_TOP in
+                # chained comparisons like "0 <= r < SIZE")
+                if expr.id in fn_params:
+                    continue
             # Only emit expression statements for non-compound expressions
             if isinstance(expr, ast.AST) and not isinstance(expr, (ast.Import, ast.ImportFrom)):
                 stmts.append(ast.Expr(value=expr))
@@ -303,6 +310,17 @@ class ASTBuilder:
             else:
                 break
 
+        # Strip duplicate trailing returns (artifacts of broken chained
+        # comparison / short-circuit expression recovery). Two consecutive
+        # return statements at the end of a function are always dead code
+        # in valid Python.
+        while len(stmts) >= 2:
+            if (isinstance(stmts[-1], ast.Return)
+                    and isinstance(stmts[-2], ast.Return)):
+                stmts.pop()
+            else:
+                break
+
         return stmts
 
     def _build_expression_body(self) -> ast.expr:
@@ -316,6 +334,90 @@ class ASTBuilder:
         if sim.stack:
             return sim.stack[-1]
         return ast.Constant(value=None)
+
+    def _match_bool_op(
+        self, instrs: List[Instruction], start: int, sim: StackSimulator
+    ) -> Optional[int]:
+        """Match boolean 'and'/'or' short-circuit pattern.
+
+        ... (docstring unchanged) ...
+
+        Returns:
+            next_index where to continue scanning, or None if no match.
+            The combined BoolOp expression is pushed onto *sim*'s stack.
+        """
+        if start >= len(instrs):
+            return None
+
+        instr = instrs[start]
+        if instr.opname not in {"JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP"}:
+            return None
+
+        target = instr.target_offset
+        if target is None:
+            return None
+
+        # Left operand is TOS of the persistent simulator
+        if not sim.stack:
+            return None
+        left = sim.stack.pop()
+
+        is_and = (instr.opname == "JUMP_IF_FALSE_OR_POP")
+
+        # Find the target instruction index
+        target_idx = None
+        for j in range(start + 1, len(instrs)):
+            if instrs[j].offset >= target:
+                target_idx = j
+                break
+        if target_idx is None:
+            sim.push(left)  # restore
+            target_idx = start + 1
+
+        # Compute right operand by simulating from start+1 to target_idx
+        # Use a temporary simulator to avoid polluting the persistent one.
+        # Skip cleanup instructions between JUMP_FORWARD and target.
+        temp_sim = StackSimulator(self.info)
+        # First, find the instructions between start+1 and target that
+        # actually compute the right operand (skip forward jumps + cleanup)
+        right_instrs = []
+        for j in range(start + 1, target_idx):
+            jinstr = instrs[j]
+            # Skip skip-over jumps and their cleanup targets
+            if jinstr.opname == "JUMP_FORWARD":
+                skip_target = jinstr.target_offset
+                if skip_target is not None and skip_target <= target:
+                    # Skip instructions until the skip target
+                    # This jumps past the "False case" cleanup code
+                    continue
+            if (jinstr.opname in {"ROT_TWO", "ROT_THREE", "POP_TOP"}
+                    and jinstr.offset > instrs[start].offset + 2):
+                # These are likely cleanup instructions for the chained
+                # comparison False case — skip them for expression recovery
+                saw_rot = any(
+                    ins.opname in {"ROT_TWO", "ROT_THREE"}
+                    for ins in instrs[start + 1:j]
+                )
+                if saw_rot:
+                    continue
+            right_instrs.append(jinstr)
+
+        for jinstr in right_instrs:
+            temp_sim.process_instruction(jinstr)
+
+        # Extract right operand from temp simulator's stack
+        if temp_sim.stack:
+            right = temp_sim.stack[-1]
+        else:
+            right = ast.Constant(value=None)
+
+        # Build BoolOp and push onto persistent simulator
+        result = ast.BoolOp(
+            op=ast.And() if is_and else ast.Or(),
+            values=[left, right],
+        )
+        sim.push(result)
+        return target_idx
 
     def _match_if_statement(
         self, instrs: List[Instruction], start: int
@@ -342,8 +444,8 @@ class ASTBuilder:
             return None
 
         # Compute condition from instructions BEFORE the POP_JUMP_IF_FALSE.
-        # POP_JUMP_IF_FALSE pops the condition, so we compute up to start-1.
-        test = self._compute_expression(instrs, start - 1) if start > 0 else ast.Constant(value=None)
+        # _compute_expression simulates up to (exclusive) the given index.
+        test = self._compute_expression(instrs, start) if start > 0 else ast.Constant(value=None)
 
         # Collect true body instructions: from start+1 until else_target
         true_instrs = []
@@ -426,11 +528,10 @@ class ASTBuilder:
           SETUP_LOOP <end_target>       (3.7 only)
           ... iterable evaluation ...
           GET_ITER
-          FOR_ITER <body_target>
+          FOR_ITER <exit_target>
+          STORE_FAST <loop_var>         (or UNPACK_SEQUENCE + STORE_*)
           ... body ...
           JUMP_ABSOLUTE <loop_start>    (back edge)
-          body_target:
-          ... body ...
           POP_BLOCK                    (3.7)
           end_target:
         """
@@ -464,36 +565,70 @@ class ASTBuilder:
             return None
 
         for_iter = instrs[for_iter_idx]
-        body_target = for_iter.target_offset
-        if body_target is None:
+        exit_target = for_iter.target_offset
+        if exit_target is None:
             return None
 
-        # The iterable is computed before GET_ITER
-        # The loop variable is stored at body_target
-
-        # Find body instructions
+        # ── Skip loop variable store (after FOR_ITER) ───────────────────
+        # FOR_ITER pushes the next iterator value; the next instruction(s)
+        # store it into the loop variable. These are NOT part of the body.
         body_start = for_iter_idx + 1
+        if body_start < len(instrs):
+            if instrs[body_start].opname == "UNPACK_SEQUENCE":
+                # for a, b in iterable: UNPACK_SEQUENCE 2; STORE_FAST a; STORE_FAST b
+                n = instrs[body_start].arg
+                body_start += 1  # skip UNPACK_SEQUENCE
+                for _ in range(n):
+                    if body_start < len(instrs) and instrs[body_start].opname.startswith("STORE_"):
+                        body_start += 1
+                    else:
+                        break
+            elif instrs[body_start].opname.startswith("STORE_"):
+                body_start += 1  # skip STORE_FAST loop_var
+
+        # ── Extract body instructions ──────────────────────────────────
+        # Body: from body_start to the first instruction at exit_target
+        # EXCLUDING the terminal JUMP_ABSOLUTE (back edge)
         body_instrs = []
-        body_end = for_iter_idx + 1
+        body_end = body_start
         for j in range(body_start, len(instrs)):
-            if instrs[j].offset >= body_target:
-                body_instrs = [ins for ins in instrs[body_start:j]
-                              if ins.offset < body_target]
+            jinstr = instrs[j]
+            if jinstr.offset >= exit_target:
                 body_end = j
                 break
+            if jinstr.opname in {"JUMP_ABSOLUTE", "JUMP_BACKWARD"}:
+                # Back edge — this is the end of the body
+                body_instrs = [ins for ins in instrs[body_start:j]
+                              if ins.offset < exit_target]
+                body_end = j + 1
+                break
+        else:
+            body_instrs = [ins for ins in instrs[body_start:body_end]
+                          if ins.offset < exit_target]
 
-        # Find loop end
+        # Fallback: if body_instrs is empty, fill from body_start to body_end
+        if not body_instrs:
+            body_instrs = [ins for ins in instrs[body_start:body_end]
+                          if ins.offset < exit_target]
+
+        # Remove trailing jumps from body
+        while body_instrs and body_instrs[-1].opname in {
+            "JUMP_ABSOLUTE", "JUMP_BACKWARD", "JUMP_FORWARD",
+        }:
+            body_instrs.pop()
+
+        # Find loop end (after exit_target)
         loop_end = len(instrs)
-        if setup_target:
+        if exit_target is not None:
             for j in range(body_end, len(instrs)):
-                if instrs[j].offset >= setup_target:
+                if instrs[j].offset >= exit_target:
                     loop_end = j
                     break
 
-        # Build AST
-        iter_expr = self._compute_expression(instrs, get_iter_idx - 1)
+        # Build AST — _compute_expression simulates up to (exclusive) get_iter_idx
+        iter_expr = self._compute_expression(instrs, get_iter_idx)
         target = self._compute_loop_target(instrs, for_iter_idx)
-        body = self._build_body(body_instrs)
+        body = self._build_body(body_instrs) if body_instrs else [ast.Pass()]
 
         return ast.For(
             target=target,
@@ -571,7 +706,8 @@ class ASTBuilder:
         if not has_backward:
             return None
 
-        # Build test expression
+        # Build test expression — _compute_expression stops before cond_end
+        # (the POP_JUMP_IF_FALSE), recovering the condition on the stack.
         test = self._compute_expression(instrs, cond_end)
 
         body = self._build_body(body_instrs)
@@ -585,24 +721,24 @@ class ASTBuilder:
     ) -> Optional[Tuple[ast.Try, int]]:
         """Match try/except/finally patterns.
 
-        3.7 pattern:
+        Python 3.7 try/except bytecode:
           SETUP_EXCEPT <handler_target>
           ... try body ...
           POP_BLOCK
-          JUMP_FORWARD <end_target>
+          JUMP_FORWARD <end_target>   (or JUMP_ABSOLUTE)
           handler_target:
-          ... except body ...
+            DUP_TOP                         # dup exception for matching
+            LOAD_GLOBAL/LOAD_NAME <exc_type> # exception class to match
+            COMPARE_OP 10 (exception match)
+            POP_JUMP_IF_FALSE <reraise>
+            POP_TOP × 3                     # clear exc info
+            ... handler body ...
+            JUMP_FORWARD <end_target>       # skip re-raise
+          reraise:
+            END_FINALLY
           end_target:
 
-        3.8 pattern:
-          SETUP_FINALLY <handler_target>
-          ... try body ...
-          POP_BLOCK
-          JUMP_FORWARD <end_target>
-          handler_target:
-          ... handler body ...
-          END_FINALLY
-          end_target:
+        Python 3.8+ uses SETUP_FINALLY instead of SETUP_EXCEPT.
         """
         if start >= len(instrs):
             return None
@@ -615,71 +751,120 @@ class ASTBuilder:
         if handler_target is None:
             return None
 
-        # Find POP_BLOCK → JUMP_FORWARD
+        # ── Find try body boundary ──────────────────────────────────
+        # Look for POP_BLOCK or the first instruction at handler_target
+        try_end_idx = start + 1
         pop_block_idx = None
-        jump_forward_idx = None
-        end_target = None
         for j in range(start + 1, len(instrs)):
             jinstr = instrs[j]
             if jinstr.offset >= handler_target:
+                try_end_idx = j
                 break
             if jinstr.opname == "POP_BLOCK":
                 pop_block_idx = j
-            elif pop_block_idx and jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
-                jump_forward_idx = j
-                end_target = jinstr.target_offset
+            elif pop_block_idx is not None and jinstr.opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
+                try_end_idx = j
                 break
 
-        if pop_block_idx is None:
-            pop_block_idx = start + 1
-            for j in range(start + 1, len(instrs)):
-                if instrs[j].offset >= handler_target:
-                    pop_block_idx = j - 1
-                    break
-
-        # Try body
-        try_instrs = [ins for ins in instrs[start + 1:pop_block_idx + 1]
-                      if ins.offset < handler_target]
-        try_body = self._build_body(try_instrs)
-        if not try_body:
+        # Build try body
+        if pop_block_idx is not None and pop_block_idx > start + 1:
+            try_body = self._build_body(instrs[start + 1:pop_block_idx])
+        elif try_end_idx > start + 1:
+            try_body = self._build_body(instrs[start + 1:try_end_idx])
+        else:
             try_body = [ast.Pass()]
 
-        # Handler body
-        handler_end = pop_block_idx + 1
-        if end_target:
-            for j in range(pop_block_idx + 1, len(instrs)):
-                if instrs[j].offset >= end_target:
-                    handler_end = j
+        # ── Find the overall end_target ──────────────────────────────
+        end_target = None
+        for j in range(try_end_idx, min(try_end_idx + 5, len(instrs))):
+            if instrs[j].opname == "END_FINALLY":
+                end_target = instrs[j].offset + 2
+                break
+            if instrs[j].opname in {"JUMP_FORWARD", "JUMP_ABSOLUTE"}:
+                end_target = instrs[j].target_offset
+                break
+        if end_target is None:
+            for j in range(try_end_idx, len(instrs)):
+                if instrs[j].opname == "END_FINALLY":
+                    end_target = instrs[j].offset + 2
                     break
+        if end_target is None:
+            end_target = instrs[-1].offset + 4
 
-        handler_instrs = [ins for ins in instrs
-                         if handler_target <= ins.offset < (end_target or handler_target + 100)]
-        handler_body = self._build_body(handler_instrs)
-        if not handler_body:
-            handler_body = [ast.Pass()]
+        # ── Parse handler code ──────────────────────────────────────
+        handler_start_idx = None
+        for j in range(start + 1, len(instrs)):
+            if instrs[j].offset >= handler_target:
+                handler_start_idx = j
+                break
+        if handler_start_idx is None:
+            handler_start_idx = try_end_idx
 
-        # Determine if finally (SETUP_FINALLY) or except (SETUP_EXCEPT)
-        if instr.opname == "SETUP_FINALLY":
-            return ast.Try(
-                body=try_body,
-                handlers=[],
-                finalbody=handler_body,
-                orelse=[],
-            ), max(handler_end, pop_block_idx + 1)
+        # Slice handler instructions
+        handler_instrs = [
+            ins for ins in instrs[handler_start_idx:]
+            if ins.offset < end_target
+        ]
+        # Parse out exception type and handler body
+        exc_type = None
+        body_instrs = handler_instrs
 
-        # Try/except
-        handlers = [ast.ExceptHandler(
-            type=None,
-            name=None,
-            body=handler_body,
-        )]
+        if handler_instrs:
+            # Check for exception match preamble
+            if (len(handler_instrs) >= 4
+                    and handler_instrs[0].opname == "DUP_TOP"
+                    and handler_instrs[1].opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_ATTR"}
+                    and handler_instrs[2].opname == "COMPARE_OP"
+                    and handler_instrs[3].opname == "POP_JUMP_IF_FALSE"):
+                exc_type = _name_node(handler_instrs[1].argval or "<exc>")
+                # Skip: DUP_TOP, LOAD_*, COMPARE_OP, POP_JUMP_IF_FALSE, POP_TOP×3
+                skip = 4
+                while skip < len(handler_instrs) and handler_instrs[skip].opname == "POP_TOP":
+                    skip += 1
+                body_instrs = handler_instrs[skip:]
+            elif (handler_instrs
+                  and handler_instrs[0].opname == "POP_TOP"):
+                # Bare except: POP_TOP × 3
+                skip = 0
+                while skip < len(handler_instrs) and handler_instrs[skip].opname == "POP_TOP":
+                    skip += 1
+                body_instrs = handler_instrs[skip:]
+
+        # Strip trailing JUMP/END_FINALLY from body_instrs
+        cut = len(body_instrs)
+        for j in range(len(body_instrs) - 1, -1, -1):
+            if body_instrs[j].opname in {
+                "JUMP_FORWARD", "JUMP_ABSOLUTE", "END_FINALLY",
+                "POP_BLOCK", "JUMP_BACKWARD",
+            }:
+                cut = j
+            else:
+                break
+        body_instrs = body_instrs[:cut]
+
+        handler_body = self._build_body(body_instrs) if body_instrs else [ast.Pass()]
+
+        is_finally = (instr.opname == "SETUP_FINALLY")
+
+        # Build Try node
+        handlers = []
+        finalbody = []
+        if is_finally:
+            finalbody = handler_body
+        else:
+            handlers = [ast.ExceptHandler(type=exc_type, name=None, body=handler_body)]
+
+        # Determine consumed instruction range
+        final_idx = handler_start_idx + len(handler_instrs)
+        if final_idx < len(instrs) and instrs[final_idx].opname in {"POP_BLOCK", "END_FINALLY"}:
+            final_idx += 1
 
         return ast.Try(
             body=try_body,
             handlers=handlers,
-            finalbody=[],
+            finalbody=finalbody,
             orelse=[],
-        ), max(handler_end, pop_block_idx + 1)
+        ), final_idx
 
     def _match_with_statement(
         self, instrs: List[Instruction], start: int
@@ -723,8 +908,8 @@ class ASTBuilder:
         body_instrs = instrs[ctx_expr_start:body_end]
         body = self._build_body(body_instrs)
 
-        # Context expression
-        ctx_expr = self._compute_expression(instrs, ctx_expr_start)
+        # Context expression — computed after SETUP_WITH, before the body
+        ctx_expr = self._compute_expression(instrs, ctx_expr_start) if ctx_expr_start < len(instrs) else ast.Constant(value=None)
 
         return ast.With(
             items=[ast.withitem(context_expr=ctx_expr, optional_vars=None)],
@@ -780,7 +965,7 @@ class ASTBuilder:
             return None
 
         import types
-        from .types import CodeObjectInfo
+        from .pyc_types import CodeObjectInfo
         from .loader import _extract_code_info, _collect_nested_code_objects
 
         class_info = None
@@ -876,7 +1061,7 @@ class ASTBuilder:
 
         import types
 
-        from .types import CodeObjectInfo
+        from .pyc_types import CodeObjectInfo
         from .loader import _extract_code_info, _collect_nested_code_objects
 
         i0 = instrs[start]
@@ -1041,15 +1226,33 @@ class ASTBuilder:
 
         return stmts[0] if stmts else None
 
+    _CONDITION_JUMP_OPS = {
+        "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+        "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
+        "FOR_ITER", "JUMP_FORWARD", "JUMP_ABSOLUTE", "JUMP_BACKWARD",
+    }
+
     def _compute_expression(
         self, instrs: List[Instruction], end_idx: int
     ) -> ast.expr:
-        """Compute the expression computed up to (and including) end_idx."""
+        """Compute the expression on the stack before instruction *end_idx*.
+
+        Simulates instructions from 0 up to (but not including) *end_idx*.
+        Stops early if a conditional jump or control-flow instruction is
+        encountered, since those consume/modify the condition stack.
+        """
         sim = StackSimulator(self.info)
-        for i in range(end_idx + 1):
-            sim.process_instruction(instrs[i])
-        if sim.stack:
-            return sim.stack[-1]
+        for i in range(end_idx):
+            instr = instrs[i]
+            # Stop before conditional jumps — they consume the expression
+            if instr.opname in self._CONDITION_JUMP_OPS:
+                break
+            sim.process_instruction(instr)
+        # Filter out Import/Alias nodes left on stack by import handling
+        exprs = [s for s in sim.stack
+                 if not isinstance(s, (ast.Import, ast.alias))]
+        if exprs:
+            return exprs[-1]
         return ast.Constant(value=None)
 
     def _compute_loop_target(

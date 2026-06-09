@@ -23,7 +23,7 @@ import types
 from typing import Tuple
 
 from .magics import format_version, get_python_version, is_supported
-from .types import CodeObjectInfo
+from .pyc_types import CodeObjectInfo
 
 
 class LoadError(Exception):

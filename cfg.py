@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .types import Instruction, BasicBlock, CodeObjectInfo
+from .pyc_types import Instruction, BasicBlock, CodeObjectInfo
 
 
 class ControlFlowGraph:

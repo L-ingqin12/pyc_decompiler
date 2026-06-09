@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, List, Set
 
-from .types import Instruction, CodeObjectInfo
+from .pyc_types import Instruction, CodeObjectInfo
 
 
 class DisassembleError(Exception):

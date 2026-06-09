@@ -13,7 +13,7 @@ from __future__ import annotations
 import ast
 from typing import Any, Dict, List, Optional, Tuple
 
-from .types import Instruction, BasicBlock, CodeObjectInfo
+from .pyc_types import Instruction, BasicBlock, CodeObjectInfo
 from .opcodes.base import (
     BINARY_OPS, INPLACE_OPS, UNARY_OPS, CMP_OP,
 )
@@ -297,11 +297,11 @@ class StackSimulator:
             right = self.pop()
             left = self.pop()
             op_class = _INPLACE_OP_MAP[opname]
-            stmts.append(ast.AugAssign(
-                target=left,
-                op=op_class(),
-                value=right,
-            ))
+            # Push a BinOp result (e.g. self.used + elapsed).
+            # The subsequent STORE_* instruction will create the assignment.
+            # This produces `self.x = self.x + y` instead of `self.x += y`,
+            # which is semantically equivalent.
+            self.push(ast.BinOp(left=left, op=op_class(), right=right))
 
         # --- Unary operators ---
         elif opname in _UNARY_OP_MAP:
@@ -485,10 +485,22 @@ class StackSimulator:
             parts = []
             for _ in range(n):
                 parts.insert(0, self.pop())
-            # Join parts into f-string or concatenation
             if n == 1:
                 self.push(parts[0])
+            elif any(isinstance(p, ast.FormattedValue) for p in parts):
+                # f-string: create a JoinedStr node
+                values = []
+                for p in parts:
+                    if isinstance(p, ast.FormattedValue):
+                        values.append(p)
+                    elif isinstance(p, ast.Constant) and isinstance(p.value, str):
+                        values.append(p)
+                    else:
+                        # Convert non-string expression to FormattedValue
+                        values.append(ast.FormattedValue(value=p, conversion=-1))
+                self.push(ast.JoinedStr(values=values))
             else:
+                # Plain string concatenation
                 result = parts[0]
                 for p in parts[1:]:
                     result = ast.BinOp(left=result, op=ast.Add(), right=p)
@@ -648,20 +660,22 @@ class StackSimulator:
 
         # --- Format ---
         elif opname == "FORMAT_VALUE":
-            val = self.pop()
-            fmt_spec = None
-            if arg & 0x04:
-                fmt_spec = self.pop()
+            # Stack: [value, fmt_spec] (TOS=fmt_spec if arg & 0x04)
             conversion = arg & 0x03
-            if conversion == 0:
-                pass  # no conversion
-            elif conversion == 1:
+            has_fmt = arg & 0x04
+
+            fmt_spec = None
+            if has_fmt:
+                fmt_spec = self.pop()  # TOS = format spec
+            val = self.pop()  # value to format
+
+            if conversion == 1:
                 val = ast.Call(func=_name_node("str"), args=[val], keywords=[])
             elif conversion == 2:
                 val = ast.Call(func=_name_node("repr"), args=[val], keywords=[])
             elif conversion == 3:
                 val = ast.Call(func=_name_node("ascii"), args=[val], keywords=[])
-            if fmt_spec:
+            if fmt_spec is not None:
                 val = ast.FormattedValue(
                     value=val,
                     conversion=conversion,
@@ -712,14 +726,16 @@ class StackSimulator:
         elif opname == "JUMP_IF_FALSE_OR_POP":
             # and: TOS is left operand. If false, jump (keep TOS).
             # If true (fallthrough), pop TOS and continue to evaluate right.
-            # We can't know which path at simulation time, so peek and
-            # leave TOS for the merge point.
-            pass  # TOS stays for the false/cleanup path
+            # Simulate truthy fallthrough: pop left, compute right.
+            if self.stack:
+                self.pop()
 
         elif opname == "JUMP_IF_TRUE_OR_POP":
             # or: TOS is left operand. If true, jump (keep TOS).
             # If false (fallthrough), pop TOS and continue.
-            pass  # TOS stays for the true/cleanup path
+            # Simulate falsy fallthrough: pop left, compute right.
+            if self.stack:
+                self.pop()
 
         # --- Delete ---
         elif opname.startswith("DELETE_"):
