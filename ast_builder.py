@@ -578,12 +578,17 @@ class ASTBuilder:
         if start >= len(instrs):
             return None
 
-        # Look for SETUP_LOOP (3.7) or just GET_ITER/FOR_ITER
+        # For loop MUST start at SETUP_LOOP (Python 3.7) or GET_ITER.
+        # Do NOT match if we're not at the loop header — otherwise
+        # we consume instructions that belong before the loop.
         i = start
         setup_target = None
         if instrs[i].opname == "SETUP_LOOP":
             setup_target = instrs[i].target_offset
             i += 1
+        else:
+            # Only match at GET_ITER if there's no SETUP_LOOP (Python 3.8+)
+            return None
 
         # Find GET_ITER then FOR_ITER
         get_iter_idx = None
