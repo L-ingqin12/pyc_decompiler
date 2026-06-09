@@ -289,16 +289,18 @@ class ASTBuilder:
             if isinstance(expr, ast.AST) and not isinstance(expr, (ast.Import, ast.ImportFrom)):
                 stmts.append(ast.Expr(value=expr))
 
-        # Strip trailing implicit "return None" (CPython adds this to every module)
-        while stmts:
-            last = stmts[-1]
-            if isinstance(last, ast.Return) and (
-                last.value is None
-                or (isinstance(last.value, ast.Constant) and last.value.value is None)
-            ):
-                stmts.pop()
-            else:
-                break
+        # Strip trailing implicit "return None" at MODULE level only.
+        # Functions need their explicit return None (e.g., find_win).
+        if self.info.co_name == "<module>":
+            while stmts:
+                last = stmts[-1]
+                if isinstance(last, ast.Return) and (
+                    last.value is None
+                    or (isinstance(last.value, ast.Constant) and last.value.value is None)
+                ):
+                    stmts.pop()
+                else:
+                    break
 
         # Strip trailing expression statements that are residual stack junk
         while stmts:
@@ -324,17 +326,6 @@ class ASTBuilder:
                     stmts.pop()
                 else:
                     break
-            else:
-                break
-
-        # Strip trailing "return None" at module level
-        while stmts:
-            last = stmts[-1]
-            if isinstance(last, ast.Return) and (
-                last.value is None
-                or (isinstance(last.value, ast.Constant) and last.value.value is None)
-            ):
-                stmts.pop()
             else:
                 break
 
